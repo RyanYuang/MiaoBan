@@ -41,6 +41,8 @@ extern "C" {
 
 #define TAG "ESP-VoCat"
 
+
+
 /** BMI270（I2C）：用于摇晃检测，驱动屏幕短时表情反馈；失败则仅关闭该功能。 */
 namespace Bmi270Motion {
 static bmi270_handle_t bmi_handle_ = nullptr;
@@ -298,11 +300,9 @@ public:
     void Printcharge()
     {
         const char* FunctionName = "Charge::Printcharge";
-        ESP_LOGI(FunctionName, "RyanYuang Battery task Printcharge");
-        ReadRegs(0x08, read_buffer_, 2);
-        ESP_LOGI(FunctionName, "RyanYuang Battery task ReadRegs-1");
-        ReadRegs(0x0c, read_buffer_ + 2, 2);
-        ESP_LOGI(FunctionName, "RyanYuang Battery task ReadRegs-2");
+        ESP_LOGI(FunctionName, "RyanYuang Battery task Printcharge");        
+        // ReadRegs(0x08, read_buffer_, 2);
+        // ReadRegs(0x0c, read_buffer_ + 2, 2);
         ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
 
         int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
