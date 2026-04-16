@@ -1,3 +1,8 @@
+/**
+ * @file esp_vocat.cc
+ * ESP-VoCat 板级支持（BSP）：I2C/QSPI 显示、CST816 屏触摸、机身电容触摸、BMI270、充电与摄像头等。
+ * PCB V1.0 / V1.2 在 DetectPcbVersion() 中探测，并改写下方全局 GPIO 变量以匹配布线。
+ */
 #include "wifi_board.h"
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
@@ -36,6 +41,7 @@ extern "C" {
 
 #define TAG "ESP-VoCat"
 
+/** BMI270（I2C）：用于摇晃检测，驱动屏幕短时表情反馈；失败则仅关闭该功能。 */
 namespace Bmi270Motion {
 static bmi270_handle_t bmi_handle_ = nullptr;
 
@@ -76,8 +82,10 @@ bool ReadAccelRaw(struct bmi2_sens_data& accel)
 }
 } // namespace Bmi270Motion
 
-
+/** 片内温度传感器句柄：Charge 任务里与电池寄存器一并轮询（tsens_value）。 */
 temperature_sensor_handle_t temp_sensor = NULL;
+
+/** ST77916 面板厂商初始化序列，经 QSPI 在 st77916_vendor_config 中下发；更换屏厂需对照数据手册调整。 */
 static const st77916_lcd_init_cmd_t vendor_specific_init_yysj[] = {
     {0xF0, (uint8_t []){0x28}, 1, 0},
     {0xF2, (uint8_t []){0x28}, 1, 0},
@@ -264,7 +272,11 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_yysj[] = {
     {0x11, (uint8_t []){}, 0, 0},
     {0x00, (uint8_t []){}, 0, 120},
 };
+
+/** 最近一次片内温度读数（摄氏度），由 Charge::Printcharge 更新。 */
 float tsens_value;
+
+/** 默认按 V1.0 引脚；DetectPcbVersion() 判定为 V1.2 时改为 _2 后缀宏对应 GPIO。 */
 gpio_num_t AUDIO_I2S_GPIO_DIN = AUDIO_I2S_GPIO_DIN_1;
 gpio_num_t AUDIO_CODEC_PA_PIN = AUDIO_CODEC_PA_PIN_1;
 gpio_num_t QSPI_PIN_NUM_LCD_RST = QSPI_PIN_NUM_LCD_RST_1;
@@ -272,6 +284,7 @@ gpio_num_t TOUCH_PAD2 = TOUCH_PAD2_1;
 gpio_num_t UART1_TX = UART1_TX_1;
 gpio_num_t UART1_RX = UART1_RX_1;
 
+/** 电池侧充电管理芯片（I2C 0x55），周期读寄存器；电压/电流字段预留。 */
 class Charge : public I2cDevice {
 public:
     Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
@@ -284,30 +297,40 @@ public:
     }
     void Printcharge()
     {
+        const char* FunctionName = "Charge::Printcharge";
+        ESP_LOGI(FunctionName, "RyanYuang Battery task Printcharge");
         ReadRegs(0x08, read_buffer_, 2);
+        ESP_LOGI(FunctionName, "RyanYuang Battery task ReadRegs-1");
         ReadRegs(0x0c, read_buffer_ + 2, 2);
+        ESP_LOGI(FunctionName, "RyanYuang Battery task ReadRegs-2");
         ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
 
         int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
         int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
-        
-        // Use the variables to avoid warnings (can be removed if actual implementation uses them)
+        ESP_LOGI(FunctionName, "RyanYuang Battery task voltage: %d, current: %d", voltage, current);
         (void)voltage;
-        (void)current;
+        (void)current; /* 预留：上报电量/限流策略时可使用 */
     }
     static void TaskFunction(void *pvParameters)
     {
+        const char* FunctionName = "Charge::TaskFunction";
+        ESP_LOGI(FunctionName, "RyanYuang Battery task started");
         Charge* charge = static_cast<Charge*>(pvParameters);
+        ESP_LOGI(FunctionName, "RyanYuang Battery task initialized");
         while (true) {
+            ESP_LOGI(FunctionName, "RyanYuang Battery task running-1");
             charge->Printcharge();
+            ESP_LOGI(FunctionName, "RyanYuang Battery task running-2");
             vTaskDelay(pdMS_TO_TICKS(300));
         }
+        ESP_LOGI(FunctionName, "RyanYuang Battery task ended");
     }
 
 private:
     uint8_t* read_buffer_ = nullptr;
 };
 
+/** CST816S 屏上电容触摸（I2C 0x15）：INT 脚触发二值信号量，任务内读寄存器解析按压/抬起。 */
 class Cst816s : public I2cDevice {
 public:
     struct TouchPoint_t {
@@ -329,8 +352,7 @@ public:
         was_touched_ = false;
         press_count_ = 0;
 
-        // Create touch interrupt semaphore
-        touch_isr_mux_ = xSemaphoreCreateBinary();
+        touch_isr_mux_ = xSemaphoreCreateBinary(); /* ISR 与 touch 任务之间同步 */
         if (touch_isr_mux_ == NULL) {
             ESP_LOGE(TAG, "Failed to create touch semaphore");
         }
@@ -340,7 +362,6 @@ public:
     {
         delete[] read_buffer_;
 
-        // Delete semaphore if it exists
         if (touch_isr_mux_ != NULL) {
             vSemaphoreDelete(touch_isr_mux_);
             touch_isr_mux_ = NULL;
@@ -366,21 +387,17 @@ public:
         TouchEvent event = TOUCH_NONE;
 
         if (is_touched && !was_touched_) {
-            // Press event (transition from not touched to touched)
             press_count_++;
             event = TOUCH_PRESS;
             ESP_LOGI(TAG, "TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
         } else if (!is_touched && was_touched_) {
-            // Release event (transition from touched to not touched)
             event = TOUCH_RELEASE;
             ESP_LOGI(TAG, "TOUCH RELEASE - total presses: %d", press_count_);
         } else if (is_touched && was_touched_) {
-            // Continuous touch (hold)
             event = TOUCH_HOLD;
             ESP_LOGD(TAG, "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
         }
 
-        // Update previous state
         was_touched_ = is_touched;
         return event;
     }
@@ -395,7 +412,6 @@ public:
         press_count_ = 0;
     }
 
-    // Semaphore management methods
     SemaphoreHandle_t GetTouchSemaphore()
     {
         return touch_isr_mux_;
@@ -421,15 +437,12 @@ public:
 private:
     uint8_t* read_buffer_ = nullptr;
     TouchPoint_t tp_;
-
-    // Touch state tracking
     bool was_touched_;
     int press_count_;
-
-    // Touch interrupt semaphore
     SemaphoreHandle_t touch_isr_mux_;
 };
 
+/** VoCat 整机：继承 WifiBoard，完成上电初始化并向 Application 提供 Audio/Display/Camera/Backlight。 */
 class EspVocat : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -439,8 +452,8 @@ private:
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
-    esp_timer_handle_t touchpad_timer_;
-    esp_lcd_touch_handle_t tp;   // LCD touch handle
+    esp_timer_handle_t touchpad_timer_; /**< 当前未使用，可删或用于触摸轮询定时器 */
+    esp_lcd_touch_handle_t tp; /**< 预留：若改用 esp_lcd_touch_cst816s 驱动可在此持有句柄 */
     EspVideo* camera_ = nullptr;
     TaskHandle_t charge_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
@@ -451,6 +464,7 @@ private:
     touch_slider_handle_t touch_slider_handle_ = nullptr;
     touch_button_handle_t touch_button_handle_ = nullptr;
 
+    /** 单次表情展示结束后回到 neutral，避免界面长期停留在临时表情。 */
     static void emotion_reset_timer_callback(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
@@ -471,6 +485,7 @@ private:
         }
     }
 
+    /** 机身触摸条/触摸键反馈：限频触发 happy 表情，防止连续中断刷屏。 */
     void ShowHappyTouchFeedback()
     {
         static int64_t s_last_us = 0;
@@ -483,6 +498,7 @@ private:
         ShowTemporaryEmotion("happy", 2000);
     }
 
+    /** 轮询加速度变化，超过阈值且冷却结束则显示短时“困惑”类表情（作摇晃反馈）。 */
     static void imu_event_task(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
@@ -520,6 +536,7 @@ private:
         }
     }
 
+    /** I2C0 主总线：codec、CST816、充电 IC、BMI270 共用；并安装片内温度传感器。 */
     void InitializeI2c()
     {
         i2c_config_t i2c_cfg = {
@@ -552,6 +569,11 @@ private:
         ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
         ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
     }
+
+    /**
+     * 通过 CORDEC_POWER_CTRL 上拉策略 + codec(0x18) 是否应答区分 V1.0 / V1.2。
+     * V1.2 时切换 AUDIO/QSPI_RST/TOUCH_PAD2/UART 等全局 GPIO 变量。
+     */
     uint8_t DetectPcbVersion()
         {
             gpio_config_t gpio_conf = {
@@ -590,6 +612,7 @@ private:
             return pcb_version;
         }
 
+    /** TP_INT 边沿中断：仅唤醒 touch_event_task，具体坐标在任务里 I2C 读取。 */
     static void touch_isr_callback(void* arg)
     {
         Cst816s* touchpad = static_cast<Cst816s*>(arg);
@@ -598,6 +621,9 @@ private:
         }
     }
 
+    /**
+     * 屏触摸释放：启动阶段进入 WiFi 配网，否则切换对话开/关（与 BOOT 键逻辑一致）。
+     */
     static void touch_event_task(void* arg)
     {
         Cst816s* touchpad = static_cast<Cst816s*>(arg);
@@ -629,10 +655,15 @@ private:
 
     void InitializeCharge()
     {
-        charge_ = new Charge(i2c_bus_, 0x55);
+        const char* FunctionName = "InitializeCharge";
+        ESP_LOGI(FunctionName, "RyanYuang Initializing Charge");
+        charge_ = new Charge(i2c_bus_, 0x55); /* 电量计/充电芯片 I2C 地址 */
+        ESP_LOGI(FunctionName, "RyanYuang Charge initialized");
         xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, charge_, 6, &charge_task_handle_, 0);
+        ESP_LOGI(FunctionName, "RyanYuang Battery task created");
     }
 
+    /** CST816：0x15 + INT 引脚；ANYEDGE 以便按下与抬起都能进任务解析事件。 */
     void InitializeCst816sTouchPad()
     {
         cst816s_ = new Cst816s(i2c_bus_, 0x15);
@@ -642,7 +673,6 @@ private:
         const gpio_config_t int_gpio_config = {
             .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
             .mode = GPIO_MODE_INPUT,
-            // .intr_type = GPIO_INTR_NEGEDGE
             .intr_type = GPIO_INTR_ANYEDGE
         };
         gpio_config(&int_gpio_config);
@@ -651,6 +681,7 @@ private:
         gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
     }
 
+    /** BMI270 走 i2c_bus 抽象层句柄（与裸 i2c_bus_ 同源总线）。 */
     void InitializeBmi270()
     {
         esp_err_t imu_ret = Bmi270Motion::Initialize(shared_i2c_bus_handle_);
@@ -662,6 +693,7 @@ private:
         }
     }
 
+    /** ESP32-S3 触摸传感器通道号与 GPIO1..14 一致，其它脚返回 0 表示不可用。 */
     static uint32_t TouchChannelFromPadGpio(gpio_num_t gpio)
     {
         if (gpio == GPIO_NUM_NC) {
@@ -673,6 +705,7 @@ private:
         return 0;
     }
 
+    /** 双 Pad：左右滑或松手时触发 happy 表情（忽略纯位置上报）。 */
     static void touch_slider_event_callback(touch_slider_handle_t handle, touch_slider_event_t event, int32_t data, void* cb_arg)
     {
         (void)handle;
@@ -698,6 +731,7 @@ private:
         self->ShowHappyTouchFeedback();
     }
 
+    /** 单 Pad（V1.0）：按下 ACTIVE 时表情反馈。 */
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
     {
         (void)handle;
@@ -711,6 +745,7 @@ private:
         }
     }
 
+    /** 机身电容触摸库需在任务中周期性 handle_events（20ms）。 */
     static void touch_cap_poll_task(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
@@ -726,6 +761,9 @@ private:
         }
     }
 
+    /**
+     * 机身触摸：V1.2 双通道建 slider；V1.0 仅 PAD1 建 button。依赖 TOUCH_PAD1/2 与 ADC 触摸通道对应关系。
+     */
     void InitializeCapacitiveTouchPads()
     {
         if (TOUCH_PAD1 == GPIO_NUM_NC) {
@@ -802,6 +840,7 @@ private:
         ESP_LOGI(TAG, "Touch button (PCB v1.0): TOUCH_PAD1 GPIO%d ch%u", (int)TOUCH_PAD1, (unsigned)btn_ch[0]);
     }
 
+    /** LCD 面板 QSPI 总线（与 ST77916 panel_io 共用 QSPI_LCD_HOST）。 */
     void InitializeSpi()
     {
         const spi_bus_config_t bus_config = TAIJIPI_ST77916_PANEL_BUS_QSPI_CONFIG(QSPI_PIN_NUM_LCD_PCLK,
@@ -813,6 +852,7 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(QSPI_LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
     }
 
+    /** pcb_version 影响 RST 有效电平（flags.reset_active_high）；其余镜像/交换见 DISPLAY_* 宏。 */
     void InitializeSt77916Display(uint8_t pcb_version)
     {
 
@@ -855,6 +895,7 @@ private:
         backlight_->RestoreBrightness();
     }
 
+    /** BOOT：行为同屏触摸释放；POWER_CTRL 拉低维持外设供电策略（依硬件设计）。 */
     void InitializeButtons()
     {
         boot_button_.OnClick([this]() {
@@ -877,6 +918,7 @@ private:
     }
 
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
+    /** USB UVC 摄像头：需打开 menuconfig 中对应选项后才会编译进固件。 */
     void InitializeCamera() {
         esp_video_init_usb_uvc_config_t usb_uvc_config = {
             .uvc = {
@@ -902,8 +944,8 @@ private:
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
 
 public:
+    /** 单例析构：停任务、删触摸传感器、拆 ISR；背光/相机见类内英文说明。 */
     ~EspVocat() {
-        // Stop tasks
         if (charge_task_handle_ != nullptr) {
             vTaskDelete(charge_task_handle_);
         }
@@ -926,7 +968,6 @@ public:
             touch_button_handle_ = nullptr;
         }
 
-        // Delete objects
         delete charge_;
         delete cst816s_;
         delete display_;
@@ -934,7 +975,6 @@ public:
         // because their base classes (Backlight, Camera) don't have virtual destructors.
         // Since EspVocat is a singleton that lives for the device lifetime, this is acceptable.
 
-        // Remove GPIO ISR handler
         gpio_isr_handler_remove(TP_PIN_NUM_INT);
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
@@ -942,7 +982,6 @@ public:
             emotion_reset_timer_ = nullptr;
         }
 
-        // Disable temperature sensor
         if (temp_sensor != NULL) {
             temperature_sensor_disable(temp_sensor);
             temperature_sensor_uninstall(temp_sensor);
@@ -950,6 +989,9 @@ public:
         }
     }
 
+    /**
+     * 上电顺序：I2C → 判板 → 充电/屏触摸/IMU → QSPI 屏 → 按键与机身触摸 →（可选）UVC。
+     */
     EspVocat() : boot_button_(BOOT_BUTTON_GPIO)
     {
         const esp_timer_create_args_t emotion_timer_args = {
@@ -962,10 +1004,15 @@ public:
         ESP_ERROR_CHECK(esp_timer_create(&emotion_timer_args, &emotion_reset_timer_));
 
         InitializeI2c();
+        ESP_LOGI(TAG, "RyanYuang Initializing I2C");
         uint8_t pcb_version = DetectPcbVersion();
+        ESP_LOGI(TAG, "RyanYuang PCB version: %d", pcb_version);
         InitializeCharge();
+        ESP_LOGI(TAG, "RyanYuang Initializing Charge");
         InitializeCst816sTouchPad();
+        ESP_LOGI(TAG, "RyanYuang Initializing CST816s TouchPad");
         InitializeBmi270();
+        ESP_LOGI(TAG, "RyanYuang Initializing BMI270");
 
         InitializeSpi();
         InitializeSt77916Display(pcb_version);
@@ -976,6 +1023,7 @@ public:
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
     }
 
+    /** ES8311 + ES7210，GPIO 以 DetectPcbVersion 可能改写过的全局变量为准。 */
     virtual AudioCodec* GetAudioCodec() override
     {
         static BoxAudioCodec audio_codec(
@@ -999,6 +1047,7 @@ public:
         return display_;
     }
 
+    /** 供上层调试或其它模块直接访问屏触摸控制器（一般仅用 Board 封装即可）。 */
     Cst816s* GetTouchpad()
     {
         return cst816s_;
@@ -1014,4 +1063,5 @@ public:
     }
 };
 
+/** 编译目标为 esp-vocat 时注册为全局 Board::GetInstance() 实现。 */
 DECLARE_BOARD(EspVocat);
