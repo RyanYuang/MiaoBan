@@ -145,6 +145,10 @@ private:
 
 
     // Event handlers
+    /**
+     * 处理 MAIN_EVENT_STATE_CHANGED：根据新设备状态同步界面、LED 与音频链路。
+     * 在状态机完成迁移后，于主任务中调用。
+     */
     void HandleStateChangedEvent();
     void HandleToggleChatEvent();
     void HandleStartListeningEvent();

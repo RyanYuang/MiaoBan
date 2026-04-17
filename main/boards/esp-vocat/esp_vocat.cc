@@ -39,9 +39,9 @@ extern "C" {
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
-#define TAG "ESP-VoCat"
-
-
+namespace {
+constexpr char TAG[] = "ESP-VoCat";
+}
 
 /** BMI270（I2C）：用于摇晃检测，驱动屏幕短时表情反馈；失败则仅关闭该功能。 */
 namespace Bmi270Motion {
@@ -300,14 +300,12 @@ public:
     void Printcharge()
     {
         const char* FunctionName = "Charge::Printcharge";
-        ESP_LOGI(FunctionName, "RyanYuang Battery task Printcharge");        
         // ReadRegs(0x08, read_buffer_, 2);
         // ReadRegs(0x0c, read_buffer_ + 2, 2);
         ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
 
         int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
         int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
-        ESP_LOGI(FunctionName, "RyanYuang Battery task voltage: %d, current: %d", voltage, current);
         (void)voltage;
         (void)current; /* 预留：上报电量/限流策略时可使用 */
     }
@@ -318,9 +316,7 @@ public:
         Charge* charge = static_cast<Charge*>(pvParameters);
         ESP_LOGI(FunctionName, "RyanYuang Battery task initialized");
         while (true) {
-            ESP_LOGI(FunctionName, "RyanYuang Battery task running-1");
             charge->Printcharge();
-            ESP_LOGI(FunctionName, "RyanYuang Battery task running-2");
             vTaskDelay(pdMS_TO_TICKS(300));
         }
         ESP_LOGI(FunctionName, "RyanYuang Battery task ended");
@@ -1026,6 +1022,16 @@ public:
     /** ES8311 + ES7210，GPIO 以 DetectPcbVersion 可能改写过的全局变量为准。 */
     virtual AudioCodec* GetAudioCodec() override
     {
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            ESP_LOGI(TAG,
+                     "AudioCodec cfg: in_sr=%d out_sr=%d mclk=%d bclk=%d ws=%d din=%d dout=%d es7210=0x%02x es8311=0x%02x",
+                     AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+                     (int)AUDIO_I2S_GPIO_MCLK, (int)AUDIO_I2S_GPIO_BCLK, (int)AUDIO_I2S_GPIO_WS,
+                     (int)AUDIO_I2S_GPIO_DIN, (int)AUDIO_I2S_GPIO_DOUT,
+                     AUDIO_CODEC_ES7210_ADDR, AUDIO_CODEC_ES8311_ADDR);
+        }
         static BoxAudioCodec audio_codec(
             i2c_bus_,
             AUDIO_INPUT_SAMPLE_RATE,

@@ -22,6 +22,7 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_awesome_30_4);
 
+// 注册内置浅色/深色 LVGL 主题（背景、聊天气泡色、字体等），供主题管理器使用。
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
     auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
@@ -62,6 +63,7 @@ void LcdDisplay::InitializeLcdThemes() {
     theme_manager.RegisterTheme("dark", dark_theme);
 }
 
+// 基类构造：记录面板句柄与分辨率，加载设置中的主题，并创建预览图自动清除用的一次性定时器。
 LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width, int height)
     : panel_io_(panel_io), panel_(panel) {
     width_ = width;
@@ -77,6 +79,7 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
 
     // Create a timer to hide the preview image
     esp_timer_create_args_t preview_timer_args = {
+        // 定时到期：清除居中预览图（非微信样式下由 SetPreviewImage(nullptr) 恢复表情区）。
         .callback = [](void* arg) {
             LcdDisplay* display = static_cast<LcdDisplay*>(arg);
             display->SetPreviewImage(nullptr);
@@ -89,6 +92,7 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     esp_timer_create(&preview_timer_args, &preview_timer_);
 }
 
+// SPI 接口 LCD：清屏、打开背光/面板，初始化 LVGL 与 esp_lvgl_port，注册 RGB565 显示设备。
 SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                            int width, int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y, bool swap_xy)
     : LcdDisplay(panel_io, panel, width, height) {
@@ -171,8 +175,7 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     }
 }
 
-
-// RGB LCD implementation
+// RGB 并行接口 LCD：双缓冲、全量刷新/direct_mode，适合需要防撕裂的 RGB 面板。
 RgbLcdDisplay::RgbLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                            int width, int height, int offset_x, int offset_y,
                            bool mirror_x, bool mirror_y, bool swap_xy)
@@ -232,6 +235,7 @@ RgbLcdDisplay::RgbLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     }
 }
 
+// MIPI DSI 接口 LCD：通过 esp_lvgl_port 的 DSI 路径注册显示，支持软件旋转等标志。
 MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                             int width, int height,  int offset_x, int offset_y,
                             bool mirror_x, bool mirror_y, bool swap_xy)
@@ -283,6 +287,7 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
     }
 }
 
+// 析构：清除预览、停止 GIF、删除定时器与全部 LVGL 对象，最后释放 panel 与 IO。
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
     
@@ -342,15 +347,18 @@ LcdDisplay::~LcdDisplay() {
     }
 }
 
+// 在访问 LVGL API 前加锁（跨任务安全），底层为 esp_lvgl_port 互斥。
 bool LcdDisplay::Lock(int timeout_ms) {
     return lvgl_port_lock(timeout_ms);
 }
 
+// 与 Lock 配对，释放 LVGL 端口互斥。
 void LcdDisplay::Unlock() {
     lvgl_port_unlock();
 }
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
+// 微信样式 UI：纵向容器 + 顶栏图标 + 状态文字 + 可滚动聊天气泡区 + 低电量弹层与启动图标。
 void LcdDisplay::SetupUI() {
     // Prevent duplicate calls - if already called, return early
     if (setup_ui_called_) {
@@ -501,6 +509,7 @@ void LcdDisplay::SetupUI() {
 #else
 #define  MAX_MESSAGES 20
 #endif
+// 向聊天区追加一条气泡消息（用户/助手/系统），控制条数上限、系统消息合并与滚动位置。
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!", role, content);
@@ -697,6 +706,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     chat_message_label_ = msg_text;
 }
 
+// 微信样式：在聊天列表中以气泡形式插入预览图，按屏幕比例缩放，对象删除时释放图像内存。
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     DisplayLockGuard lock(this);
     if (content_ == nullptr) {
@@ -781,6 +791,7 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     lv_obj_scroll_to_view_recursive(img_bubble, LV_ANIM_ON);
 }
 
+// 微信样式：清空聊天区所有子控件，并重新显示居中 AI 启动图标。
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
     if (content_ == nullptr) {
@@ -801,6 +812,7 @@ void LcdDisplay::ClearChatMessages() {
     ESP_LOGI(TAG, "Chat messages cleared");
 }
 #else
+// 经典样式 UI：居中表情盒与预览图、顶栏、状态栏、底栏字幕（单行滚动或多行换行）及低电量提示。
 void LcdDisplay::SetupUI() {
     // Prevent duplicate calls - if already called, return early
     if (setup_ui_called_) {
@@ -994,6 +1006,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
 }
 
+// 经典样式：设置或清除全屏居中预览图；空指针时停止定时器并恢复表情/GIF，非空时启动自动隐藏定时器。
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     DisplayLockGuard lock(this);
     if (preview_image_ == nullptr) {
@@ -1030,6 +1043,7 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
+// 经典样式：更新底栏字幕文本；根据 hide_subtitle_ 与内容是否为空控制底栏显示与多行时底栏对齐。
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!", role, content);
@@ -1059,6 +1073,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 #endif
 }
 
+// 经典样式：清空底栏标签文字并隐藏底栏。
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
     // In non-wechat mode, just clear the chat message label and hide the bar
@@ -1071,6 +1086,7 @@ void LcdDisplay::ClearChatMessages() {
 }
 #endif
 
+// 根据情绪名显示 FontAwesome 字符、主题包内静态图或 GIF；与 GIF 控制器生命周期在同一把锁内处理。
 void LcdDisplay::SetEmotion(const char* emotion) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!", emotion);
@@ -1149,6 +1165,7 @@ void LcdDisplay::SetEmotion(const char* emotion) {
 #endif
 }
 
+// 应用新主题：刷新屏幕/顶栏/状态栏/表情/低电量等样式；微信模式下遍历聊天气泡按类型重设颜色与文字色。
 void LcdDisplay::SetTheme(Theme* theme) {
     DisplayLockGuard lock(this);
     
@@ -1291,6 +1308,7 @@ void LcdDisplay::SetTheme(Theme* theme) {
     Display::SetTheme(lvgl_theme);
 }
 
+// 设置是否全局隐藏底栏字幕；关闭隐藏时若当前有字幕文本则重新显示底栏。
 void LcdDisplay::SetHideSubtitle(bool hide) {
     DisplayLockGuard lock(this);
     hide_subtitle_ = hide;

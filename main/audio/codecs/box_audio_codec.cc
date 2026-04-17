@@ -4,7 +4,9 @@
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
 
-#define TAG "BoxAudioCodec"
+namespace {
+constexpr char TAG[] = "BoxAudioCodec";
+}
 
 BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
@@ -191,6 +193,8 @@ void BoxAudioCodec::EnableInput(bool enable) {
     if (enable == input_enabled_) {
         return;
     }
+    ESP_LOGI(TAG, "EnableInput(%d): in_sr=%d out_sr=%d channels=%d ref=%d gain=%d",
+             enable, input_sample_rate_, output_sample_rate_, input_channels_, input_reference_, input_gain_);
     if (enable) {
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
@@ -234,7 +238,13 @@ void BoxAudioCodec::EnableOutput(bool enable) {
 
 int BoxAudioCodec::Read(int16_t* dest, int samples) {
     if (input_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
+        static uint32_t s_read_count = 0;
+        esp_err_t err = esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "mic read failed err=%s samples=%d", esp_err_to_name(err), samples);
+        } else if ((++s_read_count % 200) == 0) {
+            ESP_LOGI(TAG, "mic read ok count=%lu samples=%d", (unsigned long)s_read_count, samples);
+        }
     }
     return samples;
 }

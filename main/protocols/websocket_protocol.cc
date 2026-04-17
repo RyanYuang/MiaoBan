@@ -29,8 +29,10 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     if (websocket_ == nullptr || !websocket_->IsConnected()) {
         return false;
     }
+    ESP_LOGD(TAG, "Sending audio packet, timestamp=%u, payload_size=%zu", packet->timestamp, packet->payload.size());
 
     if (version_ == 2) {
+        ESP_LOGD(TAG, "Using BinaryProtocol2 format for audio packet");
         std::string serialized;
         serialized.resize(sizeof(BinaryProtocol2) + packet->payload.size());
         auto bp2 = (BinaryProtocol2*)serialized.data();
@@ -43,6 +45,7 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
 
         return websocket_->Send(serialized.data(), serialized.size(), true);
     } else if (version_ == 3) {
+        ESP_LOGD(TAG, "Using BinaryProtocol3 format for audio packet");
         std::string serialized;
         serialized.resize(sizeof(BinaryProtocol3) + packet->payload.size());
         auto bp3 = (BinaryProtocol3*)serialized.data();

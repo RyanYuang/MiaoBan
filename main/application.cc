@@ -1,4 +1,5 @@
 #include "application.h"
+#include "protocols/protocol.h"
 #include "board.h"
 #include "display.h"
 #include "system_info.h"
@@ -17,7 +18,9 @@
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
-#define TAG "Application"
+namespace {
+constexpr char TAG[] = "Application";
+}
 
 
 Application::Application() {
@@ -162,63 +165,85 @@ void Application::Initialize() {
     display->UpdateStatusBar(true);
 }
 
+/**
+ * 应用主循环（常驻，不返回）。
+ * 通过 EventGroup 聚合网络、音频、唤醒词、按键与状态变更事件，
+ * 并按事件类型分发到对应处理函数，驱动整机状态机持续运行。
+ */
 void Application::Run() {
     // Set the priority of the main task to 10
     vTaskPrioritySet(nullptr, 10);
 
     const EventBits_t ALL_EVENTS = 
-        MAIN_EVENT_SCHEDULE |
-        MAIN_EVENT_SEND_AUDIO |
-        MAIN_EVENT_WAKE_WORD_DETECTED |
-        MAIN_EVENT_VAD_CHANGE |
-        MAIN_EVENT_CLOCK_TICK |
-        MAIN_EVENT_ERROR |
-        MAIN_EVENT_NETWORK_CONNECTED |
-        MAIN_EVENT_NETWORK_DISCONNECTED |
-        MAIN_EVENT_TOGGLE_CHAT |
-        MAIN_EVENT_START_LISTENING |
-        MAIN_EVENT_STOP_LISTENING |
-        MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED;
+        MAIN_EVENT_SCHEDULE |             // 执行 Schedule() 投递到主线程的回调任务
+        MAIN_EVENT_SEND_AUDIO |           // 发送待上行的音频包到协议层（MQTT/WebSocket）
+        MAIN_EVENT_WAKE_WORD_DETECTED |   // 唤醒词检测命中事件
+        MAIN_EVENT_VAD_CHANGE |           // 语音活动检测(VAD)状态变化
+        MAIN_EVENT_CLOCK_TICK |           // 1Hz 时钟心跳（状态栏刷新/周期调试）
+        MAIN_EVENT_ERROR |                // 全局错误提示与状态恢复
+        MAIN_EVENT_NETWORK_CONNECTED |    // 网络已连接
+        MAIN_EVENT_NETWORK_DISCONNECTED | // 网络已断开
+        MAIN_EVENT_TOGGLE_CHAT |          // 切换对话状态（按键/触摸触发）
+        MAIN_EVENT_START_LISTENING |      // 主动开始监听
+        MAIN_EVENT_STOP_LISTENING |       // 主动停止监听
+        MAIN_EVENT_ACTIVATION_DONE |      // 激活流程完成
+        MAIN_EVENT_STATE_CHANGED;         // 状态机状态变化
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
-
         if (bits & MAIN_EVENT_ERROR) {
+            // 错误统一收敛到空闲态，并弹出错误提示。
             SetDeviceState(kDeviceStateIdle);
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
         }
 
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
+            // 网络连通后触发激活/上线等后续流程。
             HandleNetworkConnectedEvent();
         }
 
         if (bits & MAIN_EVENT_NETWORK_DISCONNECTED) {
+            // 网络断开时关闭会话并刷新 UI 网络状态。
             HandleNetworkDisconnectedEvent();
         }
 
         if (bits & MAIN_EVENT_ACTIVATION_DONE) {
+            // 激活成功后切回 idle，释放 OTA 并播放成功提示音。
             HandleActivationDoneEvent();
         }
 
         if (bits & MAIN_EVENT_STATE_CHANGED) {
+            // 统一处理状态切换后的 UI/音频策略刷新。
             HandleStateChangedEvent();
         }
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
+            // 在 idle/listening/speaking 等状态间切换对话行为。
             HandleToggleChatEvent();
         }
 
         if (bits & MAIN_EVENT_START_LISTENING) {
+            // 外部触发开始监听（例如按键）。
+            ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_START_LISTENING ==================");
             HandleStartListeningEvent();
         }
 
         if (bits & MAIN_EVENT_STOP_LISTENING) {
+            // 外部触发停止监听（例如按键）。
             HandleStopListeningEvent();
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
+            // 将编码后的音频包从发送队列搬运到协议层发送。
+            ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO ==================");
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-1: sr=%d, frame_dur=%d, ts=%u, payload_size=%zu ==================", 
+                    packet ? packet->sample_rate : 0,
+                    packet ? packet->frame_duration : 0,
+                    packet ? packet->timestamp : 0);
+                ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-2: payload_size=%zu ==================", 
+                    packet ? packet->payload.size() : 0);
+               
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
@@ -226,10 +251,12 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
+            // 唤醒词命中后决定是否开通音频通道并进入监听。
             HandleWakeWordDetectedEvent();
         }
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
+            // 监听态下 VAD 变化主要用于驱动灯效反馈。
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
@@ -237,6 +264,7 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SCHEDULE) {
+            // 执行其他线程投递到主线程的任务，避免跨线程直接操作 UI/状态。
             std::unique_lock<std::mutex> lock(mutex_);
             auto tasks = std::move(main_tasks_);
             lock.unlock();
@@ -246,6 +274,7 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
+            // 周期心跳：更新时间显示并按周期输出堆内存统计。
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
@@ -849,25 +878,32 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 #endif
 }
 
+// 根据当前设备状态应用副作用：显示、LED、麦克风/推流、唤醒词、解码器。
 void Application::HandleStateChangedEvent() {
+    // 状态机在 SetDeviceState 之后给出的唯一“当前状态”。
     DeviceState new_state = state_machine_.GetState();
+    // 空闲/休眠看门狗使用；任意状态切换都会重新计数。
     clock_ticks_ = 0;
 
+    // 显示与 LED 由各板级实现提供。
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto led = board.GetLed();
+    // LED 灯效随状态变化（如呼吸灯与常亮）。
     led->OnStateChanged();
     
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();  // Clear messages first
-            display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            display->ClearChatMessages();  // 先清空消息
+            display->SetEmotion("neutral"); // 再设表情（微信模式会检查子节点数量）
+            // 完全待机：不上传语音处理；重新允许唤醒词。
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
+            // 建立音频通道/会话期间的简要界面。
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
@@ -876,28 +912,29 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
-            // Make sure the audio processor is running
+            // 确保音频处理器已运行
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for playback queue to be empty before enabling voice processing
-                // This prevents audio truncation when STOP arrives late due to network jitter
+                // 自动停止模式：先等播放队列为空再开启语音处理，
+                // 避免网络抖动导致 STOP 迟到时截断播放。
                 if (listening_mode_ == kListeningModeAutoStop) {
                     audio_service_.WaitForPlaybackQueueEmpty();
                 }
                 
-                // Send the start listening command
+                // 通知服务端开始监听
                 protocol_->SendStartListening(listening_mode_);
+                // 打开采集与编码，向服务端上行音频。
                 audio_service_.EnableVoiceProcessing(true);
             }
 
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
-            // Enable wake word detection in listening mode (configured via Kconfig)
+            // 在聆听模式下启用唤醒词检测（由 Kconfig 配置）
             audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
 #else
-            // Disable wake word detection in listening mode
+            // 在聆听模式下关闭唤醒词检测
             audio_service_.EnableWakeWordDetection(false);
 #endif
             
-            // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
+            // 在 EnableVoiceProcessing 内已调用 ResetDecoder 之后再播放提示音
             if (play_popup_on_listening_) {
                 play_popup_on_listening_ = false;
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
@@ -907,18 +944,21 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
+                // 非实时/半双工：播报 TTS 时停止上传麦克风。
                 audio_service_.EnableVoiceProcessing(false);
-                // Only AFE wake word can be detected in speaking mode
+                // 仅在说话模式下允许 AFE 唤醒词检测
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
+            // 新播放数据到来前丢弃已解码的旧缓冲。
             audio_service_.ResetDecoder();
             break;
         case kDeviceStateWifiConfiguring:
+            // 配网界面：静音麦克风并关闭唤醒，避免误触发。
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
             break;
         default:
-            // Do nothing
+            // 无操作
             break;
     }
 }

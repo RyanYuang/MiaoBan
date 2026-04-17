@@ -35,7 +35,9 @@
 #include "wake_words/esp_wake_word.h"
 #endif
 
-#define TAG "AudioService"
+namespace {
+constexpr char TAG[] = "AudioService";
+}
 
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
@@ -185,12 +187,14 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        ESP_LOGI(TAG, "Input disabled, enabling codec input (req_sr=%d req_samples=%d)", sample_rate, samples);
         codec_->EnableInput(true);
     }
 
     if (codec_->input_sample_rate() != sample_rate) {
         data.resize(samples * codec_->input_sample_rate() / sample_rate * codec_->input_channels());
         if (!codec_->InputData(data)) {
+            ESP_LOGE(TAG, "codec input read failed (resample path), req_sr=%d req_samples=%d", sample_rate, samples);
             return false;
         }
         if (input_resampler_ != nullptr) {
@@ -208,8 +212,16 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     } else {
         data.resize(samples * codec_->input_channels());
         if (!codec_->InputData(data)) {
+            ESP_LOGE(TAG, "codec input read failed (direct path), req_sr=%d req_samples=%d", sample_rate, samples);
             return false;
         }
+    }
+
+    static uint32_t s_audio_read_ok = 0;
+    if ((++s_audio_read_ok % 200) == 0) {
+        ESP_LOGI(TAG, "ReadAudioData ok count=%lu size=%u ch=%d codec_sr=%d req_sr=%d",
+                 (unsigned long)s_audio_read_ok, (unsigned)data.size(), codec_->input_channels(),
+                 codec_->input_sample_rate(), sample_rate);
     }
 
     /* Update the last input time */
@@ -227,15 +239,22 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     return true;
 }
 
+// 音频输入任务主循环：
+// 1. 等待输入侧相关事件被打开；
+// 2. 从 codec 读取麦克风数据；
+// 3. 按当前模式把数据送去音频测试、唤醒词检测或音频处理器。
 void AudioService::AudioInputTask() {
     while (true) {
+        // 阻塞等待任一输入相关功能启动，避免空转占用 CPU。
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
             AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
             pdFALSE, pdFALSE, portMAX_DELAY);
 
+        // 服务停止后立即退出任务循环。
         if (service_stopped_) {
             break;
         }
+        // 某些场景下输入链路刚恢复时需要预热一小段时间，避免读到不稳定数据。
         if (audio_input_need_warmup_) {
             audio_input_need_warmup_ = false;
             vTaskDelay(pdMS_TO_TICKS(120));
@@ -244,15 +263,17 @@ void AudioService::AudioInputTask() {
 
         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
         if (bits & AS_EVENT_AUDIO_TESTING_RUNNING) {
+            // 音频测试模式下，先检查缓存队列是否已满，避免无限堆积测试数据。
             if (audio_testing_queue_.size() >= AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS) {
                 ESP_LOGW(TAG, "Audio testing queue is full, stopping audio testing");
                 EnableAudioTesting(false);
                 continue;
             }
             std::vector<int16_t> data;
+            // 按 Opus 一帧时长读取 16k 采样率的 PCM 数据，后续会送去编码测试队列。
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
-                // If input channels is 2, we need to fetch the left channel data
+                // 测试链路只需要单声道；如果硬件输入是双声道，这里只取左声道。
                 if (codec_->input_channels() == 2) {
                     auto mono_data = std::vector<int16_t>(data.size() / 2);
                     for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
@@ -260,6 +281,7 @@ void AudioService::AudioInputTask() {
                     }
                     data = std::move(mono_data);
                 }
+                // 把采集到的测试音频交给编码线程，后续写入测试队列。
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToTestingQueue, std::move(data));
                 continue;
             }
@@ -267,12 +289,15 @@ void AudioService::AudioInputTask() {
 
         /* Feed the wake word and/or audio processor */
         if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+            // 常规输入链路按 10ms 一帧读取数据，兼顾唤醒检测和实时处理延迟。
             int samples = 160; // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
+                // 如果启用了唤醒词检测，先把这一帧喂给唤醒引擎。
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
                     wake_word_->Feed(data);
                 }
+                // 如果启用了音频处理器，再把同一帧送去做后续处理。
                 if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
                     audio_processor_->Feed(std::move(data));
                 }
@@ -280,41 +305,52 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        // Read timeout/error should not terminate the input task.
+        // 读超时或偶发错误不应直接结束任务，这里短暂等待后重试。
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");
 }
 
+// 音频输出任务主循环：
+// 1. 等待待播放的 PCM 数据进入队列；
+// 2. 从播放队列中取出任务；
+// 3. 确保输出链路已开启，再把 PCM 数据写到 codec 播放。
 void AudioService::AudioOutputTask() {
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        // 没有待播放数据时阻塞等待，直到有新任务到来或服务停止。
         audio_queue_cv_.wait(lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_; });
+        // 收到停止信号后退出输出任务。
         if (service_stopped_) {
             break;
         }
 
+        // 取出一帧待播放任务，并通知生产者队列空间已经释放。
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
         audio_queue_cv_.notify_all();
         lock.unlock();
 
+        // 如果当前输出还没开启，先启动输出并恢复功放保活定时器。
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableOutput(true);
         }
 
+        // 将 PCM 数据真正写入音频 codec，触发扬声器播放。
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
+        // 更新最近一次输出时间和统计信息，供功耗管理和调试使用。
         last_output_time_ = std::chrono::steady_clock::now();
         debug_statistics_.playback_count++;
 
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
         if (task->timestamp > 0) {
+            // 播放时间戳会提供给服务端 AEC，用于回声消除对齐。
             lock.lock();
             timestamp_queue_.push_back(task->timestamp);
         }
