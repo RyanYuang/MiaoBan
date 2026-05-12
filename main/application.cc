@@ -22,7 +22,9 @@ namespace {
 constexpr char TAG[] = "Application";
 }
 
-
+/**
+ * 构造应用单例：创建主事件组、按 Kconfig 确定 AEC 模式、注册 1Hz 时钟定时器回调。
+ */
 Application::Application() {
     event_group_ = xEventGroupCreate();
 
@@ -37,6 +39,7 @@ Application::Application() {
 #endif
 
     esp_timer_create_args_t clock_timer_args = {
+        // 1Hz 定时器回调：仅投递 MAIN_EVENT_CLOCK_TICK，具体 UI 更新在主循环中执行。
         .callback = [](void* arg) {
             Application* app = (Application*)arg;
             xEventGroupSetBits(app->event_group_, MAIN_EVENT_CLOCK_TICK);
@@ -49,6 +52,9 @@ Application::Application() {
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
 }
 
+/**
+ * 析构：停止并删除周期时钟定时器，释放主事件组。
+ */
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
@@ -57,10 +63,18 @@ Application::~Application() {
     vEventGroupDelete(event_group_);
 }
 
+/**
+ * 请求切换到目标设备状态；是否生效由状态机规则决定。
+ * @param state 目标状态
+ * @return 状态机是否接受本次迁移
+ */
 bool Application::SetDeviceState(DeviceState state) {
     return state_machine_.TransitionTo(state);
 }
 
+/**
+ * 应用启动初始化：显示与 UI、音频服务与回调、状态变更监听、网络事件、MCP 工具，并异步启动网络。
+ */
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
@@ -224,7 +238,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_START_LISTENING) {
             // 外部触发开始监听（例如按键）。
-            ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_START_LISTENING ==================");
+            // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_START_LISTENING ==================");
             HandleStartListeningEvent();
         }
 
@@ -235,14 +249,14 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             // 将编码后的音频包从发送队列搬运到协议层发送。
-            ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO ==================");
+            // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO ==================");
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-1: sr=%d, frame_dur=%d, ts=%u, payload_size=%zu ==================", 
-                    packet ? packet->sample_rate : 0,
-                    packet ? packet->frame_duration : 0,
-                    packet ? packet->timestamp : 0);
-                ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-2: payload_size=%zu ==================", 
-                    packet ? packet->payload.size() : 0);
+                // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-1: sr=%d, frame_dur=%d, ts=%u, payload_size=%zu ==================", 
+                //     packet ? packet->sample_rate : 0,
+                //     packet ? packet->frame_duration : 0,
+                //     packet ? packet->timestamp : 0);
+                // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-2: payload_size=%zu ==================", 
+                //     packet ? packet->payload.size() : 0);
                
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
@@ -287,6 +301,9 @@ void Application::Run() {
     }
 }
 
+/**
+ * 处理网络已连接：在启动/配网态下进入激活流程并拉起激活任务，刷新状态栏。
+ */
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();
@@ -299,6 +316,7 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
+        // FreeRTOS 任务入口：在独立栈上跑激活流水线，结束后清空句柄并删除自身。
         xTaskCreate([](void* arg) {
             Application* app = static_cast<Application*>(arg);
             app->ActivationTask();
@@ -312,6 +330,9 @@ void Application::HandleNetworkConnectedEvent() {
     display->UpdateStatusBar(true);
 }
 
+/**
+ * 处理网络断开：在连接/聆听/说话态下关闭音频通道，刷新状态栏。
+ */
 void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
@@ -325,6 +346,9 @@ void Application::HandleNetworkDisconnectedEvent() {
     display->UpdateStatusBar(true);
 }
 
+/**
+ * 激活流程结束：记录服务器时间标志、切空闲、展示版本、释放 OTA、降低功耗并播放就绪提示音。
+ */
 void Application::HandleActivationDoneEvent() {
     ESP_LOGI(TAG, "Activation done");
 
@@ -349,6 +373,9 @@ void Application::HandleActivationDoneEvent() {
     });
 }
 
+/**
+ * 后台激活任务：顺序执行资源版本检查、固件版本检查、协议初始化，并向主循环投递激活完成事件。
+ */
 void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
@@ -366,6 +393,9 @@ void Application::ActivationTask() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
 }
 
+/**
+ * 检查并更新资源分区（仅执行一次）：可按设置下载新资源包，成功后应用并更新界面。
+ */
 void Application::CheckAssetsVersion() {
     // Only allow CheckAssetsVersion to be called once
     if (assets_version_checked_) {
@@ -424,6 +454,9 @@ void Application::CheckAssetsVersion() {
     display->SetEmotion("microchip_ai");
 }
 
+/**
+ * 轮询 OTA 检查固件版本（含重试与退避）；若有新版本则升级，否则处理激活码/挑战直至完成。
+ */
 void Application::CheckNewVersion() {
     const int MAX_RETRY = 10;
     int retry_count = 0;
@@ -499,6 +532,9 @@ void Application::CheckNewVersion() {
     }
 }
 
+/**
+ * 按 OTA 配置创建 MQTT 或 WebSocket 协议实例，注册各类回调（音频、JSON、通道开关、错误），并启动协议。
+ */
 void Application::InitializeProtocol() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -638,6 +674,11 @@ void Application::InitializeProtocol() {
     protocol_->Start();
 }
 
+/**
+ * 向用户展示激活说明并逐位朗读激活码（数字对应预置音效）。
+ * @param code 激活码字符串
+ * @param message 配套说明文案
+ */
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
     struct digit_sound {
         char digit;
@@ -668,6 +709,9 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
     }
 }
 
+/**
+ * 弹出系统级提示：更新状态栏、表情与系统聊天区，并可选用音效强调。
+ */
 void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
     ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
     auto display = Board::GetInstance().GetDisplay();
@@ -679,6 +723,9 @@ void Application::Alert(const char* status, const char* message, const char* emo
     }
 }
 
+/**
+ * 在空闲态下清除 Alert 留下的状态/表情/系统消息，恢复待机展示。
+ */
 void Application::DismissAlert() {
     if (GetDeviceState() == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
@@ -688,18 +735,30 @@ void Application::DismissAlert() {
     }
 }
 
+/**
+ * 线程安全地请求切换对话状态：向主循环投递 MAIN_EVENT_TOGGLE_CHAT。
+ */
 void Application::ToggleChatState() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
 }
 
+/**
+ * 线程安全地请求开始监听：向主循环投递 MAIN_EVENT_START_LISTENING（手动停止模式）。
+ */
 void Application::StartListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
 }
 
+/**
+ * 线程安全地请求停止监听：向主循环投递 MAIN_EVENT_STOP_LISTENING。
+ */
 void Application::StopListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
 }
 
+/**
+ * 主循环处理「切换对话」：覆盖激活打断、配网音频测试、空闲开通道/说话打断/聆听关通道等路径。
+ */
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
     
@@ -739,6 +798,10 @@ void Application::HandleToggleChatEvent() {
     }
 }
 
+/**
+ * 在「连接中」态下继续打开音频通道（若尚未打开），成功后按指定模式进入聆听。
+ * @param mode 聆听模式（自动停或实时等）
+ */
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
@@ -754,6 +817,9 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     SetListeningMode(mode);
 }
 
+/**
+ * 主循环处理「开始监听」：与 Toggle 类似，但固定使用手动停止聆听模式。
+ */
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
     
@@ -787,6 +853,9 @@ void Application::HandleStartListeningEvent() {
     }
 }
 
+/**
+ * 主循环处理「停止监听」：退出音频测试回到配网，或在聆听态通知服务端并回到空闲。
+ */
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
     
@@ -802,6 +871,9 @@ void Application::HandleStopListeningEvent() {
     }
 }
 
+/**
+ * 主循环处理唤醒词命中：空闲时编码并开通道继续唤醒流程；说话/聆听时打断并按策略重开监听等。
+ */
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
@@ -848,6 +920,10 @@ void Application::HandleWakeWordDetectedEvent() {
     }
 }
 
+/**
+ * 在「连接中」态完成唤醒后续：打开通道、按需上送唤醒音频/事件，并进入默认聆听模式。
+ * @param wake_word 检测到的唤醒词文本
+ */
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
@@ -878,7 +954,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 #endif
 }
 
-// 根据当前设备状态应用副作用：显示、LED、麦克风/推流、唤醒词、解码器。
+/**
+ * 处理 MAIN_EVENT_STATE_CHANGED：根据当前设备状态同步界面、LED、麦克风采集、唤醒词与解码器等行为。
+ */
 void Application::HandleStateChangedEvent() {
     // 状态机在 SetDeviceState 之后给出的唯一“当前状态”。
     DeviceState new_state = state_machine_.GetState();
@@ -963,6 +1041,9 @@ void Application::HandleStateChangedEvent() {
     }
 }
 
+/**
+ * 将回调加入主线程任务队列并唤醒主循环，供其他任务安全更新 UI 或应用状态。
+ */
 void Application::Schedule(std::function<void()>&& callback) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -971,6 +1052,10 @@ void Application::Schedule(std::function<void()>&& callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
+/**
+ * 中止当前 TTS 播报：置中止标志并向服务端发送 AbortSpeaking。
+ * @param reason 中止原因（供服务端区分）
+ */
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
@@ -979,15 +1064,24 @@ void Application::AbortSpeaking(AbortReason reason) {
     }
 }
 
+/**
+ * 设置聆听模式并切换到聆听状态（触发状态机与 HandleStateChangedEvent 副作用）。
+ */
 void Application::SetListeningMode(ListeningMode mode) {
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
 }
 
+/**
+ * 由 AEC 配置推导默认聆听模式：无 AEC 用自动停止，否则用实时模式。
+ */
 ListeningMode Application::GetDefaultListeningMode() const {
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
 }
 
+/**
+ * 安全重启：关闭音频通道、释放协议、停止音频服务，延时后调用 esp_restart。
+ */
 void Application::Reboot() {
     ESP_LOGI(TAG, "Rebooting...");
     // Disconnect the audio channel
@@ -1001,6 +1095,12 @@ void Application::Reboot() {
     esp_restart();
 }
 
+/**
+ * 从指定 URL 执行固件 OTA：关通道、提功耗、停音频、下载并刷写；失败则恢复运行，成功则重启。
+ * @param url 固件包地址
+ * @param version 版本展示文案（可空）
+ * @return 是否已成功触发重启前的完整成功路径（失败返回 false）
+ */
 bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -1053,6 +1153,10 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
 }
 
+/**
+ * 外部触发的唤醒词调用（非事件位路径）：空闲时走唤醒开通道；说话/聆听时通过 Schedule 打断或关通道。
+ * @param wake_word 唤醒词文本
+ */
 void Application::WakeWordInvoke(const std::string& wake_word) {
     if (!protocol_) {
         return;
@@ -1086,6 +1190,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     }
 }
 
+/**
+ * 判断是否允许进入休眠：需为空闲、无打开音频通道且音频服务处于空闲。
+ */
 bool Application::CanEnterSleepMode() {
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
@@ -1103,6 +1210,9 @@ bool Application::CanEnterSleepMode() {
     return true;
 }
 
+/**
+ * 线程安全地向服务端发送 MCP JSON 负载：封装为 Schedule 在主任务中调用 protocol。
+ */
 void Application::SendMcpMessage(const std::string& payload) {
     // Always schedule to run in main task for thread safety
     Schedule([this, payload = std::move(payload)]() {
@@ -1112,6 +1222,9 @@ void Application::SendMcpMessage(const std::string& payload) {
     });
 }
 
+/**
+ * 设置 AEC 工作模式（关/设备端/服务端）：更新采集侧 AEC、提示用户，若通道已开则关闭以应用新配置。
+ */
 void Application::SetAecMode(AecMode mode) {
     aec_mode_ = mode;
     Schedule([this]() {
@@ -1139,10 +1252,16 @@ void Application::SetAecMode(AecMode mode) {
     });
 }
 
+/**
+ * 播放内置音效资源（委托 AudioService）。
+ */
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
 }
 
+/**
+ * 线程安全地重置协议：在主任务中关闭音频通道并释放 protocol_。
+ */
 void Application::ResetProtocol() {
     Schedule([this]() {
         // Close audio channel if opened
