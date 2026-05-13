@@ -3,9 +3,11 @@
 #include "settings_page_view.h"
 
 #include <lvgl.h>
+#include <memory>
 
 class Display;
 class LvglTheme;
+class LvglAllocatedImage;
 
 namespace ui::settings {
 
@@ -34,6 +36,8 @@ private:
     LvglTheme* theme_;
     void* root_ = nullptr;
     SettingsPagePresenter* touch_presenter_ = nullptr;
+    /** PNG from assets partition; must outlive `lv_image` on `root_`. */
+    std::unique_ptr<LvglAllocatedImage> music_btn_image_;
 };
 
 }  // namespace ui::settings

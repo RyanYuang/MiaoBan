@@ -12,7 +12,8 @@
 #define UI_PAGE_ID_LIST(X) \
     X(Settings, 0)        \
     X(Home, 1)            \
-    X(About, 2)
+    X(About, 2)           \
+    X(StickerChat, 3)
 
 enum class UiPageId : uint8_t {
 #define UI_PAGE_EXPAND_ENUM(sym, ord) k##sym = ord,

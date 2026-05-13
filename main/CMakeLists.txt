@@ -44,11 +44,13 @@ set(SOURCES "audio/audio_codec.cc"
             "ui/lvgl_page_touch_presenter.cc"
             "ui/settings/settings_page_presenter.cc"
             "ui/settings/lvgl_settings_page_view.cc"
+            "ui/sticker_chat/sticker_chat_page_presenter.cc"
+            "ui/sticker_chat/lvgl_sticker_chat_page_view.cc"
             "ui/about/about_page_presenter.cc"
             "ui/about/lvgl_about_page_view.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp" "ui" "ui/settings" "ui/about")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp" "ui" "ui/settings" "ui/about" "ui/sticker_chat")
 
 # Add board common files
 list(APPEND SOURCES

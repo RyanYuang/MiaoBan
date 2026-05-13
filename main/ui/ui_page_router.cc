@@ -129,6 +129,9 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
             display_->ShowNotification(msg.c_str(), 60000);
             break;
         }
+        case UiPageId::kStickerChat:
+            display_->ShowNotification("Sticker chat", 60000);
+            break;
         default:
             break;
     }

@@ -1,14 +1,27 @@
 #include "lvgl_settings_page_view.h"
 
+#include "assets.h"
 #include "display.h"
+#include "lvgl_image.h"
 #include "lvgl_page_touch_presenter.h"
 #include "lvgl_theme.h"
 #include "settings_page_model.h"
 #include "settings_page_presenter.h"
 
+#include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+#define TAG "LvglSettings"
+
 namespace ui::settings {
 
 namespace {
+
+/** 与 `settings_page_presenter.cc` 中一致：点击该 label 进入贴图对话页。 */
+constexpr uintptr_t kUserDataOpenStickerChat = 0x53544348u;  // 'STCH'
 
 /** 挂在根节点 user_data 上，根 DELETE 时一并释放 Presenter 与 View。 */
 struct SettingsMvpBundle {
@@ -93,12 +106,48 @@ void LvglSettingsPageView::BuildLayout(const SettingsPageModel& model)
     lv_label_set_text(label, model.title.empty() ? "Settings" : model.title.c_str());
     lv_obj_set_style_text_font(label, theme_->text_font()->font(), 0);
     lv_obj_set_style_text_color(label, theme_->text_color(), 0);
-    lv_obj_center(label);
+    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 24);
     lv_obj_add_flag(label, LV_OBJ_FLAG_CLICKABLE);
+
+    if (Assets::GetInstance().partition_valid()) {
+        void* asset_ptr = nullptr;
+        size_t asset_size = 0;
+        if (Assets::GetInstance().GetAssetData("Music_Btn.png", asset_ptr, asset_size) && asset_ptr != nullptr && asset_size > 0) {
+            auto* heap_copy = static_cast<uint8_t*>(heap_caps_malloc(asset_size, MALLOC_CAP_8BIT));
+            if (heap_copy != nullptr) {
+                memcpy(heap_copy, asset_ptr, asset_size);
+                try {
+                    music_btn_image_ = std::make_unique<LvglAllocatedImage>(heap_copy, asset_size);
+                    lv_obj_t* img = lv_image_create(panel);
+                    lv_image_set_src(img, music_btn_image_->image_dsc());
+                    lv_obj_set_size(img, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                    lv_obj_align(img, LV_ALIGN_CENTER, 0, 32);
+                    lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
+                    if (touch_presenter_ != nullptr) {
+                        ui::mvp::LvglPageAttachTouchHandlers(img, touch_presenter_);
+                    }
+                } catch (const std::runtime_error& e) {
+                    ESP_LOGW(TAG, "Music_Btn.png decode failed: %s", e.what());
+                    heap_caps_free(heap_copy);
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "Music_Btn.png not in assets (rebuild default assets & flash assets partition)");
+        }
+    }
+
+    lv_obj_t* sticker_entry = lv_label_create(panel);
+    lv_label_set_text(sticker_entry, "贴图对话");
+    lv_obj_set_style_text_font(sticker_entry, theme_->text_font()->font(), 0);
+    lv_obj_set_style_text_color(sticker_entry, theme_->text_color(), 0);
+    lv_obj_align(sticker_entry, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_add_flag(sticker_entry, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_user_data(sticker_entry, reinterpret_cast<void*>(kUserDataOpenStickerChat));
 
     if (touch_presenter_ != nullptr) {
         ui::mvp::LvglPageAttachTouchHandlers(panel, touch_presenter_);
         ui::mvp::LvglPageAttachTouchHandlers(label, touch_presenter_);
+        ui::mvp::LvglPageAttachTouchHandlers(sticker_entry, touch_presenter_);
     }
 
     root_ = panel;

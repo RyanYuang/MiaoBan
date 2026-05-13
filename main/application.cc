@@ -13,6 +13,7 @@
 #include "ui_command_dispatcher.h"
 #include "ui_page_router.h"
 
+#include <cstdio>
 #include <cstring>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -755,6 +756,7 @@ void Application::DismissAlert() {
  * 线程安全地请求切换对话状态：向主循环投递 MAIN_EVENT_TOGGLE_CHAT。
  */
 void Application::ToggleChatState() {
+    printf("ToggleChatState\n");
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
 }
 

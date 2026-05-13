@@ -13,10 +13,12 @@
 
 #include "lvgl_about_page_view.h"
 #include "lvgl_settings_page_view.h"
+#include "lvgl_sticker_chat_page_view.h"
 
 /** 登记 LVGL 整页：`X(枚举符号, View::CreateRouterPageRoot)`。 */
 #define UI_PAGE_LVGL_FACTORY(X, sym, ViewClass) X(sym, ViewClass::CreateRouterPageRoot)
 
 #define UI_PAGE_LVGL_ROOT_FACTORY_LIST(X) \
     UI_PAGE_LVGL_FACTORY(X, Settings, ui::settings::LvglSettingsPageView) \
-    UI_PAGE_LVGL_FACTORY(X, About, ui::about::LvglAboutPageView)
+    UI_PAGE_LVGL_FACTORY(X, About, ui::about::LvglAboutPageView) \
+    UI_PAGE_LVGL_FACTORY(X, StickerChat, ui::sticker_chat::LvglStickerChatPageView)
