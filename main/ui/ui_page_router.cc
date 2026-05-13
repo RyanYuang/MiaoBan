@@ -24,6 +24,7 @@ namespace {
 constexpr char TAG[] = "UiPageRouter";
 
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
+/** 按页面枚举创建该页的 LVGL 根节点；成功返回根指针，失败返回 nullptr。须在已加 Display 锁的上下文中调用。 */
 lv_obj_t* CreateLvglPageRoot(UiPageId id, Display* display) {
     auto* theme = dynamic_cast<LvglTheme*>(display->GetTheme());
     if (theme == nullptr) {
@@ -66,11 +67,13 @@ lv_obj_t* CreateLvglPageRoot(UiPageId id, Display* display) {
 
 }  // namespace
 
+/** 返回全局单例，供任意处投递路由命令。 */
 UiPageRouter& UiPageRouter::Instance() {
     static UiPageRouter instance;
     return instance;
 }
 
+/** 绑定 Display 并清空页面栈；在 SetupUI 之后、首次跳转前调用一次即可。 */
 void UiPageRouter::Init(Display* display) {
     display_ = display;
     page_stack_depth_ = 0;
@@ -79,14 +82,19 @@ void UiPageRouter::Init(Display* display) {
     }
 }
 
+/** 将「前进到指定页」投递到 UI 命令队列，在 UI 线程串行执行 ApplyNavigateTo。 */
 void UiPageRouter::PostNavigateTo(UiPageId id) {
     UiCommandDispatcher::Instance().Post([this, id]() { ApplyNavigateTo(id); });
 }
 
+/** 将「返回上一页」投递到 UI 命令队列，在 UI 线程串行执行 ApplyNavigateBack。 */
 void UiPageRouter::PostNavigateBack() {
     UiCommandDispatcher::Instance().Post([this]() { ApplyNavigateBack(); });
 }
 
+/**
+ * 在 UI 线程执行前进：LVGL 模式下创建整页根、压栈并置顶；表情模式下用通知等轻量展示，不维护 LVGL 栈。
+ */
 void UiPageRouter::ApplyNavigateTo(UiPageId id) {
     if (display_ == nullptr || id == UiPageId::kNone) {
         return;
@@ -127,6 +135,9 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
 #endif
 }
 
+/**
+ * 在 UI 线程执行返回：LVGL 模式下弹出栈顶并 lv_obj_del；表情模式下无栈，仅打日志。
+ */
 void UiPageRouter::ApplyNavigateBack() {
     if (display_ == nullptr) {
         return;
@@ -147,6 +158,7 @@ void UiPageRouter::ApplyNavigateBack() {
 #endif
 }
 
+/** 将一页的根指针压入内部栈；栈满则丢弃本次入栈并打警告日志。 */
 void UiPageRouter::PageStackPush(void* root) {
     if (root == nullptr) {
         return;
@@ -158,6 +170,7 @@ void UiPageRouter::PageStackPush(void* root) {
     page_stack_[page_stack_depth_++] = root;
 }
 
+/** 弹出当前栈顶根指针（不销毁 LVGL 对象）；栈空时返回 nullptr。 */
 void* UiPageRouter::PageStackPop() {
     if (page_stack_depth_ == 0) {
         return nullptr;
@@ -168,6 +181,7 @@ void* UiPageRouter::PageStackPop() {
     return top;
 }
 
+/** 判断内部页面栈是否为空。 */
 bool UiPageRouter::PageStackEmpty() const {
     return page_stack_depth_ == 0;
 }
