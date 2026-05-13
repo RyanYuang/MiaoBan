@@ -40,6 +40,7 @@ set(SOURCES "audio/audio_codec.cc"
             "ui/mvp/null_conversation_view.cc"
             "ui/mvp/example_conversation_presenter.cc"
             "ui/ui_command_dispatcher.cc"
+            "ui/post_simple_settings_boot_ui.cc"
             )
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp" "ui")

@@ -219,9 +219,9 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 
     static uint32_t s_audio_read_ok = 0;
     if ((++s_audio_read_ok % 200) == 0) {
-        ESP_LOGI(TAG, "ReadAudioData ok count=%lu size=%u ch=%d codec_sr=%d req_sr=%d",
-                 (unsigned long)s_audio_read_ok, (unsigned)data.size(), codec_->input_channels(),
-                 codec_->input_sample_rate(), sample_rate);
+        // ESP_LOGI(TAG, "ReadAudioData ok count=%lu size=%u ch=%d codec_sr=%d req_sr=%d",
+        //          (unsigned long)s_audio_read_ok, (unsigned)data.size(), codec_->input_channels(),
+        //          codec_->input_sample_rate(), sample_rate);
     }
 
     /* Update the last input time */

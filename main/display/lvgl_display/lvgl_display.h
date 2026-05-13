@@ -25,6 +25,9 @@ public:
     virtual void SetPowerSaveMode(bool on);
     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);
 
+    /** 仅当前主题 + 全屏 “Settings” 文案；不建聊天/顶栏等。须已持有 Display 锁的上下文调用，或由 Post 在 ui_cmd 中调用。 */
+    void SetupUISimpleSettingsScreen();
+
 protected:
     esp_pm_lock_handle_t pm_lock_ = nullptr;
     lv_display_t *display_ = nullptr;

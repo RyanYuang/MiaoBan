@@ -243,7 +243,7 @@ int BoxAudioCodec::Read(int16_t* dest, int samples) {
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "mic read failed err=%s samples=%d", esp_err_to_name(err), samples);
         } else if ((++s_read_count % 200) == 0) {
-            ESP_LOGI(TAG, "mic read ok count=%lu samples=%d", (unsigned long)s_read_count, samples);
+            // ESP_LOGI(TAG, "mic read ok count=%lu samples=%d", (unsigned long)s_read_count, samples);
         }
     }
     return samples;
