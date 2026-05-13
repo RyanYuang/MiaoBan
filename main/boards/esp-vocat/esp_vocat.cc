@@ -7,6 +7,10 @@
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
 #include "display/emote_display.h"
+#if !CONFIG_USE_EMOTE_MESSAGE_STYLE
+#include "lvgl_display.h"
+#include <esp_lvgl_port.h>
+#endif
 #include "application.h"
 #include "button.h"
 #include "config.h"
@@ -443,13 +447,14 @@ class EspVocat : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     i2c_bus_handle_t shared_i2c_bus_handle_ = nullptr;
-    Cst816s* cst816s_;
+    Cst816s* cst816s_ = nullptr;
     Charge* charge_;
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
     esp_timer_handle_t touchpad_timer_; /**< 当前未使用，可删或用于触摸轮询定时器 */
-    esp_lcd_touch_handle_t tp; /**< 预留：若改用 esp_lcd_touch_cst816s 驱动可在此持有句柄 */
+    esp_lcd_touch_handle_t tp = nullptr; /**< LVGL 模式：esp_lcd_touch CST816 句柄；Emote 模式保持 nullptr */
+    bool cst816s_tp_isr_registered_ = false;
     EspVideo* camera_ = nullptr;
     TaskHandle_t charge_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
@@ -659,7 +664,8 @@ private:
         ESP_LOGI(FunctionName, "RyanYuang Battery task created");
     }
 
-    /** CST816：0x15 + INT 引脚；ANYEDGE 以便按下与抬起都能进任务解析事件。 */
+    /** CST816：仅 Emote 模式自建 I2C 轮询任务 + INT 唤醒；LVGL 模式改用 esp_lcd_touch + lvgl_port（见 InitializeLvglPanelTouch）。 */
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
     void InitializeCst816sTouchPad()
     {
         cst816s_ = new Cst816s(i2c_bus_, 0x15);
@@ -672,10 +678,73 @@ private:
             .intr_type = GPIO_INTR_ANYEDGE
         };
         gpio_config(&int_gpio_config);
-        gpio_install_isr_service(0);
+        esp_err_t isr_svc = gpio_install_isr_service(0);
+        if (isr_svc != ESP_OK && isr_svc != ESP_ERR_INVALID_STATE) {
+            ESP_ERROR_CHECK(isr_svc);
+        }
         gpio_intr_enable(TP_PIN_NUM_INT);
         gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
+        cst816s_tp_isr_registered_ = true;
     }
+#else
+    /** LVGL：CST816 经 esp_lcd_touch 接入 `lvgl_port`，坐标与面板 swap/mirror 一致。须在 SpiLcdDisplay 创建之后调用。 */
+    void InitializeLvglPanelTouch()
+    {
+        auto* lvgl = dynamic_cast<LvglDisplay*>(display_);
+        if (lvgl == nullptr || lvgl->GetLvglDisplayHandle() == nullptr) {
+            ESP_LOGE(TAG, "InitializeLvglPanelTouch: no LvglDisplay");
+            return;
+        }
+
+        esp_lcd_touch_config_t tp_cfg = {
+            .x_max = static_cast<uint16_t>(DISPLAY_WIDTH - 1),
+            .y_max = static_cast<uint16_t>(DISPLAY_HEIGHT - 1),
+            .rst_gpio_num = TP_PIN_NUM_RST,
+            .int_gpio_num = TP_PIN_NUM_INT,
+            .levels = {
+                .reset = 0,
+                .interrupt = 0,
+            },
+            .flags = {
+                .swap_xy = DISPLAY_SWAP_XY,
+                .mirror_x = DISPLAY_MIRROR_X,
+                .mirror_y = DISPLAY_MIRROR_Y,
+            },
+            .process_coordinates = nullptr,
+            .interrupt_callback = nullptr,
+            .user_data = nullptr,
+        };
+
+        esp_lcd_panel_io_handle_t tp_io_handle = nullptr;
+        esp_lcd_panel_io_i2c_config_t tp_io_config = {
+            .dev_addr = ESP_LCD_TOUCH_IO_I2C_CST816S_ADDRESS,
+            .on_color_trans_done = nullptr,
+            .user_ctx = nullptr,
+            .control_phase_bytes = 1,
+            .dc_bit_offset = 0,
+            .lcd_cmd_bits = 8,
+            .lcd_param_bits = 0,
+            .flags = {
+                .dc_low_on_data = 0,
+                .disable_control_phase = 1,
+            },
+            .scl_speed_hz = 400 * 1000,
+        };
+
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
+        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &tp));
+
+        lvgl_port_touch_cfg_t touch_cfg = {};
+        touch_cfg.disp = lvgl->GetLvglDisplayHandle();
+        touch_cfg.handle = tp;
+        lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (touch_indev == nullptr) {
+            ESP_LOGE(TAG, "lvgl_port_add_touch failed");
+        } else {
+            ESP_LOGI(TAG, "LVGL touch: CST816S via esp_lcd_touch + lvgl_port_add_touch");
+        }
+    }
+#endif
 
     /** BMI270 走 i2c_bus 抽象层句柄（与裸 i2c_bus_ 同源总线）。 */
     void InitializeBmi270()
@@ -965,13 +1034,22 @@ public:
         }
 
         delete charge_;
+#if !CONFIG_USE_EMOTE_MESSAGE_STYLE
+        if (tp != nullptr) {
+            esp_lcd_touch_del(tp);
+            tp = nullptr;
+        }
+#endif
         delete cst816s_;
         delete display_;
         // Note: backlight_ (PwmBacklight) and camera_ (EspVideo) are not deleted here
         // because their base classes (Backlight, Camera) don't have virtual destructors.
         // Since EspVocat is a singleton that lives for the device lifetime, this is acceptable.
 
-        gpio_isr_handler_remove(TP_PIN_NUM_INT);
+        if (cst816s_tp_isr_registered_) {
+            gpio_isr_handler_remove(TP_PIN_NUM_INT);
+            cst816s_tp_isr_registered_ = false;
+        }
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
             esp_timer_delete(emotion_reset_timer_);
@@ -1005,13 +1083,18 @@ public:
         ESP_LOGI(TAG, "RyanYuang PCB version: %d", pcb_version);
         InitializeCharge();
         ESP_LOGI(TAG, "RyanYuang Initializing Charge");
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
         InitializeCst816sTouchPad();
-        ESP_LOGI(TAG, "RyanYuang Initializing CST816s TouchPad");
+        ESP_LOGI(TAG, "RyanYuang Initializing CST816s TouchPad (emote)");
+#endif
         InitializeBmi270();
         ESP_LOGI(TAG, "RyanYuang Initializing BMI270");
 
         InitializeSpi();
         InitializeSt77916Display(pcb_version);
+#if !CONFIG_USE_EMOTE_MESSAGE_STYLE
+        InitializeLvglPanelTouch();
+#endif
         InitializeButtons();
         InitializeCapacitiveTouchPads();
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

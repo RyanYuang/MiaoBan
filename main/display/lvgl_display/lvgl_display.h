@@ -25,6 +25,9 @@ public:
     virtual void SetPowerSaveMode(bool on);
     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);
 
+    /** `lvgl_port_add_disp` 之后的 LVGL 显示句柄，供板级注册触摸等使用。 */
+    lv_display_t* GetLvglDisplayHandle() const { return display_; }
+
     /** 仅当前主题 + 全屏 “Settings” 文案；不建聊天/顶栏等。须已持有 Display 锁的上下文调用，或由 Post 在 ui_cmd 中调用。 */
     void SetupUISimpleSettingsScreen();
 

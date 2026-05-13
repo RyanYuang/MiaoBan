@@ -1,9 +1,11 @@
 #include "ui_page_router.h"
 
 #include "display.h"
+#include "system_info.h"
 #include "ui_command_dispatcher.h"
 
 #include <cstddef>
+#include <string>
 
 #include <sdkconfig.h>
 
@@ -48,6 +50,34 @@ lv_obj_t* CreateLvglPageRoot(UiPageId id, Display* display) {
             lv_obj_set_style_bg_color(panel, theme->chat_background_color(), 0);
             lv_label_set_text(label, "Home");
             break;
+        case UiPageId::kAbout: {
+            lv_obj_set_style_bg_color(panel, theme->background_color(), 0);
+            lv_obj_add_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_all(panel, theme->spacing(4), 0);
+            lv_obj_set_style_pad_row(panel, theme->spacing(3), 0);
+            lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+            lv_label_set_text(label, "About");
+            lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
+            lv_obj_set_style_text_color(label, theme->text_color(), 0);
+
+            std::string body = SystemInfo::GetChipModelName();
+            body += "\n";
+            body += SystemInfo::GetMacAddress();
+            body += "\n\n";
+            body += SystemInfo::GetUserAgent();
+
+            lv_obj_t* details = lv_label_create(panel);
+            lv_label_set_text(details, body.c_str());
+            lv_obj_set_style_text_font(details, theme->text_font()->font(), 0);
+            lv_obj_set_style_text_color(details, theme->text_color(), 0);
+            const lv_coord_t side = theme->spacing(4);
+            lv_obj_set_width(details, LV_HOR_RES - 2 * side);
+            lv_label_set_long_mode(details, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(details, LV_TEXT_ALIGN_LEFT, 0);
+            return panel;
+        }
         default:
             lv_obj_del(panel);
             return nullptr;
@@ -109,6 +139,14 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
         case UiPageId::kHome:
             display_->ShowNotification("Home", 60000);
             break;
+        case UiPageId::kAbout: {
+            std::string msg = "About\n";
+            msg += SystemInfo::GetChipModelName();
+            msg += "\n";
+            msg += SystemInfo::GetMacAddress();
+            display_->ShowNotification(msg.c_str(), 60000);
+            break;
+        }
         default:
             break;
     }

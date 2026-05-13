@@ -41,7 +41,7 @@ UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Home));
 UiPageRouter::Instance().PostNavigateBack();
 ```
 
-- **`UI_PAGE_ID(符号)`**：符号必须与 `ui_page_ids.h` 里 `UI_PAGE_ID_LIST` 中的名字一致（例如 `Settings`、`Home`）。
+- **`UI_PAGE_ID(符号)`**：符号必须与 `ui_page_ids.h` 里 `UI_PAGE_ID_LIST` 中的名字一致（例如 `Settings`、`Home`、`About`）。
 - **`PostNavigateTo`**：入队后在 UI 线程创建该页根节点并 **压栈**，再 **`lv_obj_move_foreground`**。
 - **`PostNavigateBack`**：栈非空时 **`lv_obj_del` 栈顶根** 并出栈；栈已空则什么也不做。
 
@@ -56,7 +56,8 @@ UiPageRouter::Instance().PostNavigateBack();
 ```c
 #define UI_PAGE_ID_LIST(X) \
     X(Settings, 0) \
-    X(Home, 1)
+    X(Home, 1) \
+    X(About, 2)
 ```
 
 - 每加一页：在这里加一行 **`X(页面名, 序号)`**。
@@ -68,14 +69,14 @@ UiPageRouter::Instance().PostNavigateBack();
 ## 新增一页要改哪里（三步）
 
 1. **`ui_page_ids.h`**  
-   在 `UI_PAGE_ID_LIST` 增加一项，例如：`X(About, 2)`。
+   在 `UI_PAGE_ID_LIST` 增加一项，例如：`X(MyPage, 3)`（序号不与现有重复即可）。
 
 2. **`ui_page_router.cc`**  
-   在 **`CreateLvglPageRoot`** 的 `switch (id)` 里增加 **`case UiPageId::kAbout:`**，创建整屏根 `lv_obj_t*`（及其子控件），设置好样式后 **`return panel`**。未知 `id` 应删掉半成品并 **`return nullptr`**。
+   在 **`CreateLvglPageRoot`** 的 `switch (id)` 里增加分支（可参考现有 **`About`**：标题 + `SystemInfo` 文案 + 可滚动面板）。
 
 3. **业务代码**  
    在需要跳转处调用：  
-   `UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(About));`
+   `UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(MyPage));`
 
 若某页需要带参数（例如设置项 key），当前实现是「只传 ID」；可后续扩展为 `PostNavigateTo` 携带 `std::string` 等按值捕获进 lambda（注意线程与生命周期）。
 
