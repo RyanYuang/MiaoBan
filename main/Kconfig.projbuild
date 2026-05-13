@@ -6,6 +6,24 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+menu "UI command dispatcher"
+    config UI_CMD_QUEUE_MAX_DEPTH
+        int "Max UI command queue depth"
+        default 32
+        range 4 256
+        help
+            When full, oldest pending commands are dropped. FIFO order is preserved for remaining items.
+
+    config UI_CMD_TASK_STACK_SIZE
+        int "UI worker task stack size (bytes)"
+        default 4096
+
+    config UI_CMD_TASK_PRIORITY
+        int "UI worker task priority"
+        default 5
+        range 1 24
+endmenu
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

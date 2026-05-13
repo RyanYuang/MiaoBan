@@ -819,6 +819,7 @@ void LcdDisplay::SetupUI() {
         ESP_LOGW(TAG, "SetupUI() called multiple times, skipping duplicate call");
         return;
     }
+    printf("LcdDisplay::SetupUI\n");
     
     Display::SetupUI();  // Mark SetupUI as called
     DisplayLockGuard lock(this);

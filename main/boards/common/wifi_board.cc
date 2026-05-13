@@ -2,6 +2,7 @@
 
 #include "display.h"
 #include "application.h"
+#include "ui_command_dispatcher.h"
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
@@ -198,7 +199,12 @@ void WifiBoard::StartWifiConfigMode() {
 
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
-    GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+    Display* disp = GetDisplay();
+    UiCommandDispatcher::Instance().Post([disp]() {
+        if (disp != nullptr) {
+            disp->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+        }
+    });
 
     auto& app = Application::GetInstance();
     auto state = app.GetDeviceState();

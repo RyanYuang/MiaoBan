@@ -10,6 +10,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "ui_command_dispatcher.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -79,13 +80,16 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
-    // Setup the display
+    // 启动 UI 命令队列：专用 ui_cmd 任务按序执行 Post 投递的界面更新
+    UiCommandDispatcher::Instance().Start();
+
+    // 初始化显示：创建 LVGL/表情等主界面控件（具体由 Display 子类实现）
     auto display = board.GetDisplay();
     display->SetupUI();
-    // Print board name/version info
+    // 首条系统消息：展示板级名称与版本等 User-Agent 信息
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
-    // Setup the audio service
+    // 初始化音频服务并启动采集/播放管线
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
@@ -102,20 +106,20 @@ void Application::Initialize() {
     };
     audio_service_.SetCallbacks(callbacks);
 
-    // Add state change listeners
+    // 状态机迁移时向主循环投递 MAIN_EVENT_STATE_CHANGED，统一刷新 UI/音频策略
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
     });
 
-    // Start the clock timer to update the status bar
+    // 启动 1Hz 周期定时器，用于状态栏刷新与周期调试输出
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
-    // Add MCP common tools (only once during initialization)
+    // 注册 MCP 内置与用户工具（仅初始化阶段执行一次）
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
 
-    // Set network event callback for UI updates and network state handling
+    // 网络层事件回调：更新通知/状态栏，并通过 EventGroup 驱动连接与断线等主流程
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
         auto display = Board::GetInstance().GetDisplay();
         
@@ -126,10 +130,10 @@ void Application::Initialize() {
                 break;
             case NetworkEvent::Connecting: {
                 if (data.empty()) {
-                    // Cellular network - registering without carrier info yet
+                    // 蜂窝网络：尚无运营商信息时的注册中状态
                     display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
                 } else {
-                    // WiFi or cellular with carrier info
+                    // WiFi 或已带运营商信息的蜂窝：展示正在连接的 SSID/运营商名
                     std::string msg = Lang::Strings::CONNECT_TO;
                     msg += data;
                     msg += "...";
@@ -148,12 +152,12 @@ void Application::Initialize() {
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
                 break;
             case NetworkEvent::WifiConfigModeEnter:
-                // WiFi config mode enter is handled by WifiBoard internally
+                // 进入 WiFi 配网模式：具体 UI 由 WifiBoard 内部处理
                 break;
             case NetworkEvent::WifiConfigModeExit:
-                // WiFi config mode exit is handled by WifiBoard internally
+                // 退出 WiFi 配网模式：具体逻辑由 WifiBoard 内部处理
                 break;
-            // Cellular modem specific events
+            // 蜂窝模组相关事件
             case NetworkEvent::ModemDetecting:
                 display->SetStatus(Lang::Strings::DETECTING_MODULE);
                 break;
@@ -172,10 +176,10 @@ void Application::Initialize() {
         }
     });
 
-    // Start network asynchronously
+    // 异步启动网络（不阻塞 Initialize 返回）
     board.StartNetwork();
 
-    // Update the status bar immediately to show the network state
+    // 立即刷新状态栏，呈现当前网络相关图标与文案
     display->UpdateStatusBar(true);
 }
 
@@ -251,13 +255,6 @@ void Application::Run() {
             // 将编码后的音频包从发送队列搬运到协议层发送。
             // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO ==================");
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-1: sr=%d, frame_dur=%d, ts=%u, payload_size=%zu ==================", 
-                //     packet ? packet->sample_rate : 0,
-                //     packet ? packet->frame_duration : 0,
-                //     packet ? packet->timestamp : 0);
-                // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO-2: payload_size=%zu ==================", 
-                //     packet ? packet->payload.size() : 0);
-               
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
@@ -359,8 +356,10 @@ void Application::HandleActivationDoneEvent() {
 
     auto display = Board::GetInstance().GetDisplay();
     std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
-    display->ShowNotification(message.c_str());
-    display->SetChatMessage("system", "");
+    UiCommandDispatcher::Instance().Post([display, message = std::move(message)]() {
+        display->ShowNotification(message.c_str());
+        display->SetChatMessage("system", "");
+    });
 
     // Release OTA object after activation is complete
     ota_.reset();
@@ -429,10 +428,10 @@ void Application::CheckAssetsVersion() {
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         display->SetChatMessage("system", Lang::Strings::PLEASE_WAIT);
 
-        bool success = assets.Download(download_url, [this, display](int progress, size_t speed) -> void {
+        bool success = assets.Download(download_url, [display](int progress, size_t speed) -> void {
             char buffer[32];
             snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
-            Schedule([display, message = std::string(buffer)]() {
+            UiCommandDispatcher::Instance().Post([display, message = std::string(buffer)]() {
                 display->SetChatMessage("system", message.c_str());
             });
         });
@@ -465,7 +464,9 @@ void Application::CheckNewVersion() {
     auto& board = Board::GetInstance();
     while (true) {
         auto display = board.GetDisplay();
-        display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+        UiCommandDispatcher::Instance().Post([display]() {
+            display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+        });
 
         esp_err_t err = ota_->CheckVersion();
         if (err != ESP_OK) {
@@ -508,7 +509,9 @@ void Application::CheckNewVersion() {
             break;
         }
 
-        display->SetStatus(Lang::Strings::ACTIVATION);
+        UiCommandDispatcher::Instance().Post([display]() {
+            display->SetStatus(Lang::Strings::ACTIVATION);
+        });
         // Activation code is shown to the user and waiting for the user to input
         if (ota_->HasActivationCode()) {
             ShowActivationCode(ota_->GetActivationCode(), ota_->GetActivationMessage());
@@ -540,7 +543,9 @@ void Application::InitializeProtocol() {
     auto display = board.GetDisplay();
     auto codec = board.GetAudioCodec();
 
-    display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+    UiCommandDispatcher::Instance().Post([display]() {
+        display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+    });
 
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
@@ -552,7 +557,9 @@ void Application::InitializeProtocol() {
     }
 
     protocol_->OnConnected([this]() {
-        DismissAlert();
+        UiCommandDispatcher::Instance().Post([this]() {
+            DismissAlert();
+        });
     });
 
     protocol_->OnNetworkError([this](const std::string& message) {
@@ -576,7 +583,7 @@ void Application::InitializeProtocol() {
     
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        Schedule([this]() {
+        UiCommandDispatcher::Instance().Post([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -607,7 +614,7 @@ void Application::InitializeProtocol() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring)]() {
+                    UiCommandDispatcher::Instance().Post([display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -616,14 +623,14 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring)]() {
+                UiCommandDispatcher::Instance().Post([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
-                Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
+                UiCommandDispatcher::Instance().Post([display, emotion_str = std::string(emotion->valuestring)]() {
                     display->SetEmotion(emotion_str.c_str());
                 });
             }
@@ -650,7 +657,13 @@ void Application::InitializeProtocol() {
             auto message = cJSON_GetObjectItem(root, "message");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
-                Alert(status->valuestring, message->valuestring, emotion->valuestring, Lang::Sounds::OGG_VIBRATION);
+                std::string s_status(status->valuestring);
+                std::string s_message(message->valuestring);
+                std::string s_emotion(emotion->valuestring);
+                UiCommandDispatcher::Instance().Post([this, s_status = std::move(s_status), s_message = std::move(s_message),
+                                                      s_emotion = std::move(s_emotion)]() {
+                    Alert(s_status.c_str(), s_message.c_str(), s_emotion.c_str(), Lang::Sounds::OGG_VIBRATION);
+                });
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
@@ -659,7 +672,7 @@ void Application::InitializeProtocol() {
             auto payload = cJSON_GetObjectItem(root, "payload");
             ESP_LOGI(TAG, "Received custom message: %s", cJSON_PrintUnformatted(root));
             if (cJSON_IsObject(payload)) {
-                Schedule([this, display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
+                UiCommandDispatcher::Instance().Post([display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
                     display->SetChatMessage("system", payload_str.c_str());
                 });
             } else {
@@ -1127,10 +1140,10 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    bool upgrade_success = Ota::Upgrade(upgrade_url, [this, display](int progress, size_t speed) {
+    bool upgrade_success = Ota::Upgrade(upgrade_url, [display](int progress, size_t speed) {
         char buffer[32];
         snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
-        Schedule([display, message = std::string(buffer)]() {
+        UiCommandDispatcher::Instance().Post([display, message = std::string(buffer)]() {
             display->SetChatMessage("system", message.c_str());
         });
     });

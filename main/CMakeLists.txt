@@ -39,9 +39,10 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             "ui/mvp/null_conversation_view.cc"
             "ui/mvp/example_conversation_presenter.cc"
+            "ui/ui_command_dispatcher.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp" "ui")
 
 # Add board common files
 list(APPEND SOURCES
