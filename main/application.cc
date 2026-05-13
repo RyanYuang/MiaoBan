@@ -11,7 +11,7 @@
 #include "assets.h"
 #include "settings.h"
 #include "ui_command_dispatcher.h"
-#include "post_simple_settings_boot_ui.h"
+#include "ui_page_router.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -87,7 +87,8 @@ void Application::Initialize() {
     // 初始化显示：创建 LVGL/表情等主界面控件（具体由 Display 子类实现）
     auto display = board.GetDisplay();
     display->SetupUI();
-    PostSimpleSettingsBootUi(display);
+    UiPageRouter::Instance().Init(display);
+    UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Settings));
     // 首条系统消息：展示板级名称与版本等 User-Agent 信息
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 

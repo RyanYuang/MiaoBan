@@ -35,3 +35,7 @@ LVGL 仍由 `esp_lvgl_port` 驱动；每个 job 里通常会调用带 `DisplayLo
 在 GPIO、WiFi、定时器等回调里，对 `GetDisplay()->ShowNotification`、`SetStatus` 等，优先 **`Post`**，避免在任意任务里直接调 `Display` 造成顺序不确定。
 
 其它板卡可参考 `boards/bread-compact-wifi/compact_wifi_board.cc` 与 `boards/common/wifi_board.cc` 的模式逐步迁移。
+
+## 相关文档
+
+- 基于本队列的 **页面 ID + 栈式返回**：[`README_PAGE_ROUTER.md`](README_PAGE_ROUTER.md)。
