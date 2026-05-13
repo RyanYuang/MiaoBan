@@ -3,6 +3,7 @@
 #include "display.h"
 #include "system_info.h"
 #include "ui_command_dispatcher.h"
+#include "ui_page_ids.h"
 
 #include <cstddef>
 #include <string>
@@ -14,6 +15,7 @@
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
 #include "lvgl_display.h"
 #include "lvgl_theme.h"
+#include "ui_page_lvgl_registry.h"
 #include <lvgl.h>
 #endif
 
@@ -29,64 +31,36 @@ lv_obj_t* CreateLvglPageRoot(UiPageId id, Display* display) {
         return nullptr;
     }
 
-    lv_obj_t* screen = lv_screen_active();
-    lv_obj_t* panel = lv_obj_create(screen);
-    lv_obj_set_size(panel, LV_HOR_RES, LV_VER_RES);
-    lv_obj_align(panel, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_radius(panel, 0, 0);
-    lv_obj_set_style_pad_all(panel, 0, 0);
-    lv_obj_set_style_border_width(panel, 0, 0);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* label = lv_label_create(panel);
-
     switch (id) {
-        case UiPageId::kSettings:
-            lv_obj_set_style_bg_color(panel, theme->background_color(), 0);
-            lv_label_set_text(label, "Settings");
-            break;
-        case UiPageId::kHome:
-            lv_obj_set_style_bg_color(panel, theme->chat_background_color(), 0);
-            lv_label_set_text(label, "Home");
-            break;
-        case UiPageId::kAbout: {
-            lv_obj_set_style_bg_color(panel, theme->background_color(), 0);
-            lv_obj_add_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-            lv_obj_set_style_pad_all(panel, theme->spacing(4), 0);
-            lv_obj_set_style_pad_row(panel, theme->spacing(3), 0);
-            lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+#define UI_PAGE_LVGL_ROOT_CASE(sym, factory) \
+    case UI_PAGE_ID(sym): \
+        return static_cast<lv_obj_t*>((factory)(display, theme));
 
-            lv_label_set_text(label, "About");
+        UI_PAGE_LVGL_ROOT_FACTORY_LIST(UI_PAGE_LVGL_ROOT_CASE)
+#undef UI_PAGE_LVGL_ROOT_CASE
+
+        case UiPageId::kHome: {
+            lv_obj_t* screen = lv_screen_active();
+            lv_obj_t* panel = lv_obj_create(screen);
+            lv_obj_set_size(panel, LV_HOR_RES, LV_VER_RES);
+            lv_obj_align(panel, LV_ALIGN_TOP_LEFT, 0, 0);
+            lv_obj_set_style_radius(panel, 0, 0);
+            lv_obj_set_style_pad_all(panel, 0, 0);
+            lv_obj_set_style_border_width(panel, 0, 0);
+            lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+            lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_style_bg_color(panel, theme->chat_background_color(), 0);
+
+            lv_obj_t* label = lv_label_create(panel);
+            lv_label_set_text(label, "Home");
             lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
             lv_obj_set_style_text_color(label, theme->text_color(), 0);
-
-            std::string body = SystemInfo::GetChipModelName();
-            body += "\n";
-            body += SystemInfo::GetMacAddress();
-            body += "\n\n";
-            body += SystemInfo::GetUserAgent();
-
-            lv_obj_t* details = lv_label_create(panel);
-            lv_label_set_text(details, body.c_str());
-            lv_obj_set_style_text_font(details, theme->text_font()->font(), 0);
-            lv_obj_set_style_text_color(details, theme->text_color(), 0);
-            const lv_coord_t side = theme->spacing(4);
-            lv_obj_set_width(details, LV_HOR_RES - 2 * side);
-            lv_label_set_long_mode(details, LV_LABEL_LONG_WRAP);
-            lv_obj_set_style_text_align(details, LV_TEXT_ALIGN_LEFT, 0);
+            lv_obj_center(label);
             return panel;
         }
         default:
-            lv_obj_del(panel);
             return nullptr;
     }
-
-    lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
-    lv_obj_set_style_text_color(label, theme->text_color(), 0);
-    lv_obj_center(label);
-    return panel;
 }
 #endif
 
@@ -120,7 +94,7 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
 
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
     auto* lvgl = dynamic_cast<LvglDisplay*>(display_);
-    if (lvgl == nullptr || !lvgl->IsSetupUICalled()) {
+    if (lvgl == nullptr || !display_->IsSetupUICalled()) {
         ESP_LOGW(TAG, "NavigateTo: not LvglDisplay or SetupUI not called");
         return;
     }

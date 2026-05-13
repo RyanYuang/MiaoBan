@@ -71,8 +71,8 @@ UiPageRouter::Instance().PostNavigateBack();
 1. **`ui_page_ids.h`**  
    在 `UI_PAGE_ID_LIST` 增加一项，例如：`X(MyPage, 3)`（序号不与现有重复即可）。
 
-2. **`ui_page_router.cc`**  
-   在 **`CreateLvglPageRoot`** 的 `switch (id)` 里增加分支（可参考现有 **`About`**：标题 + `SystemInfo` 文案 + 可滚动面板）。
+2. **`ui_page_lvgl_registry.h`**（非 emote / LVGL 主界面）  
+   在 **`UI_PAGE_LVGL_ROOT_FACTORY_LIST`** 里追加一行：`UI_PAGE_LVGL_FACTORY(X, 页面符号, 某View类)`，并在该头文件 `#include` 对应 View。像 **`Home`** 这类不走工厂的页仍在 **`ui_page_router.cc`** 的 `switch` 里手写。
 
 3. **业务代码**  
    在需要跳转处调用：  
