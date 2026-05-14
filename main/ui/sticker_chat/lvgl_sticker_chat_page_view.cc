@@ -5,6 +5,7 @@
 #include "lvgl_page_touch_presenter.h"
 #include "lvgl_theme.h"
 #include "sticker_chat_page_presenter.h"
+#include "sticker_chat_quick_settings.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -23,6 +24,7 @@ struct StickerChatMvpBundle {
     bool* page_alive = nullptr;
     StickerChatPagePresenter* presenter = nullptr;
     LvglStickerChatPageView* view = nullptr;
+    void* quick_settings_ctx = nullptr;
 };
 
 static void StickerChatRootOnDelete(lv_event_t* e)
@@ -38,6 +40,7 @@ static void StickerChatRootOnDelete(lv_event_t* e)
     if (bundle->page_alive != nullptr) {
         *bundle->page_alive = false;
     }
+    sticker_chat_quick_settings_destroy(bundle->quick_settings_ctx);
     delete bundle->presenter;
     delete bundle->view;
     if (bundle->page_alive != nullptr) {
@@ -71,7 +74,7 @@ void* LvglStickerChatPageView::CreateRouterPageRoot(Display* display, LvglTheme*
         return nullptr;
     }
 
-    auto* bundle = new StickerChatMvpBundle{page_alive, presenter, view};
+    auto* bundle = new StickerChatMvpBundle{page_alive, presenter, view, view->quick_settings_ctx()};
     lv_obj_set_user_data(root, bundle);
     lv_obj_add_event_cb(root, StickerChatRootOnDelete, LV_EVENT_DELETE, nullptr);
     return root;
@@ -162,6 +165,8 @@ void LvglStickerChatPageView::BuildLayout()
         ui::mvp::LvglPageAttachTouchHandlers(title, touch_presenter_);
         ui::mvp::LvglPageAttachTouchHandlers(hint, touch_presenter_);
     }
+
+    quick_settings_ctx_ = sticker_chat_quick_settings_create(panel, display_, theme_);
 
     root_ = panel;
 }

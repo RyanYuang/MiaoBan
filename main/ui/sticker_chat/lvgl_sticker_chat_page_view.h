@@ -24,6 +24,9 @@ public:
 
     void* RootHandle() const { return root_; }
 
+    /** 供根节点 bundle 在 DELETE 时释放；由 BuildLayout 内创建。 */
+    void* quick_settings_ctx() const { return quick_settings_ctx_; }
+
     void BindTouchPresenter(StickerChatPagePresenter* p) { touch_presenter_ = p; }
 
     /** 在 `CreateRouterPageRoot` 里于 `BuildLayout` 前设置，用于生命周期与状态监听。 */
@@ -35,6 +38,7 @@ private:
     void* root_ = nullptr;
     bool* page_alive_ = nullptr;
     StickerChatPagePresenter* touch_presenter_ = nullptr;
+    void* quick_settings_ctx_ = nullptr;
     std::unique_ptr<LvglAllocatedImage> sticker_image_;
 };
 

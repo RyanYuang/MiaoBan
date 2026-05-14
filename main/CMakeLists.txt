@@ -46,6 +46,7 @@ set(SOURCES "audio/audio_codec.cc"
             "ui/settings/lvgl_settings_page_view.cc"
             "ui/sticker_chat/sticker_chat_page_presenter.cc"
             "ui/sticker_chat/lvgl_sticker_chat_page_view.cc"
+            "ui/sticker_chat/sticker_chat_quick_settings.cc"
             "ui/about/about_page_presenter.cc"
             "ui/about/lvgl_about_page_view.cc"
             )

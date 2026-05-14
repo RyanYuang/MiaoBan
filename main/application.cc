@@ -99,8 +99,7 @@ void Application::Initialize() {
     auto display = board.GetDisplay();
     display->SetupUI();
     UiPageRouter::Instance().Init(display);
-    // 设置页在栈底，贴纸聊天为进入系统后首屏；返回键可回到设置。
-    UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Settings));
+    // 整页根节点由路由在「跳转」时按需创建（ApplyNavigateTo），此处只进入首屏。
     UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(StickerChat));
     // 首条系统消息：展示板级名称与版本等 User-Agent 信息
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());

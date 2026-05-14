@@ -77,7 +77,7 @@ void StickerChatPagePresenter::OnClick(lv_event_t* e)
     const uintptr_t ud = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target));
 
     if (ud == kUserDataBack) {
-        UiPageRouter::Instance().PostNavigateBack();
+        UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Settings));
         return;
     }
     if (ud == kUserDataSticker) {
