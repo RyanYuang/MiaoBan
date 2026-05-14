@@ -24,6 +24,9 @@ public:
     /** 入队：弹出并销毁栈顶页面根；栈空则无操作。 */
     void PostNavigateBack();
 
+    /** 入队：循环出栈直到空，关掉所有叠在主页上的整页（露出 LcdDisplay 主界面）。 */
+    void PostNavigateCloseAll();
+
     UiPageRouter(const UiPageRouter&) = delete;
     UiPageRouter& operator=(const UiPageRouter&) = delete;
 
@@ -32,6 +35,7 @@ private:
 
     void ApplyNavigateTo(UiPageId id);
     void ApplyNavigateBack();
+    void ApplyNavigateCloseAll();
 
     Display* display_ = nullptr;
     /** LVGL 下存 lv_obj_t*；非 LVGL 路径不压栈。 */

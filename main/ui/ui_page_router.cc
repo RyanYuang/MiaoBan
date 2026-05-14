@@ -92,6 +92,11 @@ void UiPageRouter::PostNavigateBack() {
     UiCommandDispatcher::Instance().Post([this]() { ApplyNavigateBack(); });
 }
 
+/** 将「关闭全部叠页」投递到 UI 命令队列。 */
+void UiPageRouter::PostNavigateCloseAll() {
+    UiCommandDispatcher::Instance().Post([this]() { ApplyNavigateCloseAll(); });
+}
+
 /**
  * 在 UI 线程执行前进：LVGL 模式下创建整页根、压栈并置顶；表情模式下用通知等轻量展示，不维护 LVGL 栈。
  */
@@ -158,6 +163,30 @@ void UiPageRouter::ApplyNavigateBack() {
     }
 #else
     ESP_LOGD(TAG, "NavigateBack: emote style has no LVGL page stack");
+#endif
+}
+
+void UiPageRouter::ApplyNavigateCloseAll()
+{
+    if (display_ == nullptr) {
+        return;
+    }
+
+#ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
+    auto* lvgl = dynamic_cast<LvglDisplay*>(display_);
+    if (lvgl == nullptr || !display_->IsSetupUICalled()) {
+        ESP_LOGW(TAG, "NavigateCloseAll: not LvglDisplay or SetupUI not called");
+        return;
+    }
+    DisplayLockGuard lock(display_);
+    while (!PageStackEmpty()) {
+        void* top = PageStackPop();
+        if (top != nullptr) {
+            lv_obj_del(static_cast<lv_obj_t*>(top));
+        }
+    }
+#else
+    ESP_LOGD(TAG, "NavigateCloseAll: emote style has no LVGL page stack");
 #endif
 }
 

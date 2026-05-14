@@ -20,6 +20,7 @@ constexpr uintptr_t kUserDataBack = 0x4241434Bu;
 constexpr uintptr_t kUserDataSticker = 0x53544B52u;
 
 struct StickerChatMvpBundle {
+    bool* page_alive = nullptr;
     StickerChatPagePresenter* presenter = nullptr;
     LvglStickerChatPageView* view = nullptr;
 };
@@ -34,8 +35,14 @@ static void StickerChatRootOnDelete(lv_event_t* e)
     if (bundle == nullptr) {
         return;
     }
+    if (bundle->page_alive != nullptr) {
+        *bundle->page_alive = false;
+    }
     delete bundle->presenter;
     delete bundle->view;
+    if (bundle->page_alive != nullptr) {
+        delete bundle->page_alive;
+    }
     delete bundle;
     lv_obj_set_user_data(root, nullptr);
 }
@@ -51,6 +58,8 @@ void* LvglStickerChatPageView::CreateRouterPageRoot(Display* display, LvglTheme*
     }
     auto* view = new LvglStickerChatPageView(display, theme);
     auto* presenter = new StickerChatPagePresenter();
+    bool* page_alive = new bool(true);
+    view->SetPageAliveFlag(page_alive);
     view->BindTouchPresenter(presenter);
     view->BuildLayout();
 
@@ -58,10 +67,11 @@ void* LvglStickerChatPageView::CreateRouterPageRoot(Display* display, LvglTheme*
     if (root == nullptr) {
         delete presenter;
         delete view;
+        delete page_alive;
         return nullptr;
     }
 
-    auto* bundle = new StickerChatMvpBundle{presenter, view};
+    auto* bundle = new StickerChatMvpBundle{page_alive, presenter, view};
     lv_obj_set_user_data(root, bundle);
     lv_obj_add_event_cb(root, StickerChatRootOnDelete, LV_EVENT_DELETE, nullptr);
     return root;
@@ -140,6 +150,10 @@ void LvglStickerChatPageView::BuildLayout()
         } else {
             ESP_LOGW(TAG, "Chat_btn.png not in assets");
         }
+    }
+
+    if (touch_presenter_ != nullptr && page_alive_ != nullptr) {
+        touch_presenter_->AttachStateHints(display_, page_alive_, hint);
     }
 
     if (touch_presenter_ != nullptr) {

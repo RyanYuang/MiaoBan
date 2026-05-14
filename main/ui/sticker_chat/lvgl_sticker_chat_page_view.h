@@ -26,10 +26,14 @@ public:
 
     void BindTouchPresenter(StickerChatPagePresenter* p) { touch_presenter_ = p; }
 
+    /** 在 `CreateRouterPageRoot` 里于 `BuildLayout` 前设置，用于生命周期与状态监听。 */
+    void SetPageAliveFlag(bool* page_alive) { page_alive_ = page_alive; }
+
 private:
     Display* display_;
     LvglTheme* theme_;
     void* root_ = nullptr;
+    bool* page_alive_ = nullptr;
     StickerChatPagePresenter* touch_presenter_ = nullptr;
     std::unique_ptr<LvglAllocatedImage> sticker_image_;
 };

@@ -65,7 +65,11 @@ public:
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
-    
+
+    /** 订阅设备状态迁移（回调在 `TransitionTo` 调用方上下文中同步触发；改 UI 请投递到 ui_cmd）。 */
+    int AddDeviceStateChangeListener(DeviceStateMachine::StateCallback callback);
+    void RemoveDeviceStateChangeListener(int listener_id);
+
     /**
      * Request state transition
      * Returns true if transition was successful

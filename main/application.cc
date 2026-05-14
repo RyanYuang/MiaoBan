@@ -75,6 +75,16 @@ bool Application::SetDeviceState(DeviceState state) {
     return state_machine_.TransitionTo(state);
 }
 
+int Application::AddDeviceStateChangeListener(DeviceStateMachine::StateCallback callback)
+{
+    return state_machine_.AddStateChangeListener(std::move(callback));
+}
+
+void Application::RemoveDeviceStateChangeListener(int listener_id)
+{
+    state_machine_.RemoveStateChangeListener(listener_id);
+}
+
 /**
  * 应用启动初始化：显示与 UI、音频服务与回调、状态变更监听、网络事件、MCP 工具，并异步启动网络。
  */
@@ -89,7 +99,9 @@ void Application::Initialize() {
     auto display = board.GetDisplay();
     display->SetupUI();
     UiPageRouter::Instance().Init(display);
+    // 设置页在栈底，贴纸聊天为进入系统后首屏；返回键可回到设置。
     UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Settings));
+    UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(StickerChat));
     // 首条系统消息：展示板级名称与版本等 User-Agent 信息
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
