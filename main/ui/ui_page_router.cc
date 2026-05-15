@@ -137,6 +137,9 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
         case UiPageId::kStickerChat:
             display_->ShowNotification("Sticker chat", 60000);
             break;
+        case UiPageId::kQrCode:
+            display_->ShowNotification("QR code", 60000);
+            break;
         default:
             break;
     }

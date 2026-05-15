@@ -12,6 +12,7 @@
  */
 
 #include "lvgl_about_page_view.h"
+#include "lvgl_qrcode_page_view.h"
 #include "lvgl_settings_page_view.h"
 #include "lvgl_sticker_chat_page_view.h"
 
@@ -21,4 +22,5 @@
 #define UI_PAGE_LVGL_ROOT_FACTORY_LIST(X) \
     UI_PAGE_LVGL_FACTORY(X, Settings, ui::settings::LvglSettingsPageView) \
     UI_PAGE_LVGL_FACTORY(X, About, ui::about::LvglAboutPageView) \
-    UI_PAGE_LVGL_FACTORY(X, StickerChat, ui::sticker_chat::LvglStickerChatPageView)
+    UI_PAGE_LVGL_FACTORY(X, StickerChat, ui::sticker_chat::LvglStickerChatPageView) \
+    UI_PAGE_LVGL_FACTORY(X, QrCode, ui::qrcode::LvglQrCodePageView)
