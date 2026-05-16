@@ -42,10 +42,15 @@ struct StickerChatQuickSettingsCtx {
     lv_coord_t open_zone_y_max = 0;
 
     lv_coord_t sheet_h = 0;
+    /** 拖动/动画过程中用于局部 invalidate 的上一次高度。 */
+    lv_coord_t sheet_h_painted = 0;
     QsDragPhase phase = QsDragPhase::kNone;
     lv_coord_t press_y = 0;
     lv_coord_t sheet_h_at_press = 0;
 };
+
+/** 跟手拖动时 scrim 固定半透明，避免每帧改 bg_opa 触发全屏重绘。 */
+static constexpr lv_opa_t kDragScrimOpa = 100;
 
 static lv_coord_t clamp_y(lv_coord_t v, lv_coord_t lo, lv_coord_t hi)
 {
@@ -119,7 +124,38 @@ static void on_quick_btn_click(lv_event_t* e)
     }
 }
 
-static void apply_sheet_geometry(StickerChatQuickSettingsCtx* c);
+static void apply_sheet_geometry_full(StickerChatQuickSettingsCtx* c);
+static void apply_sheet_geometry_drag(StickerChatQuickSettingsCtx* c, lv_coord_t new_h);
+
+static void invalidate_height_band(lv_obj_t* obj, lv_coord_t y0, lv_coord_t y1)
+{
+    if (obj == nullptr || y1 <= y0) {
+        return;
+    }
+    lv_area_t area = {
+        .x1 = 0,
+        .y1 = y0,
+        .x2 = static_cast<lv_coord_t>(lv_obj_get_width(obj) - 1),
+        .y2 = static_cast<lv_coord_t>(y1 - 1),
+    };
+    lv_obj_invalidate_area(obj, &area);
+}
+
+static void invalidate_sheet_height_delta(StickerChatQuickSettingsCtx* c, lv_coord_t old_h, lv_coord_t new_h)
+{
+    if (c == nullptr || c->sheet == nullptr || old_h == new_h) {
+        return;
+    }
+    if (new_h > old_h) {
+        invalidate_height_band(c->sheet, old_h, new_h);
+        return;
+    }
+    lv_obj_t* parent = lv_obj_get_parent(c->sheet);
+    if (parent != nullptr) {
+        invalidate_height_band(parent, new_h, old_h);
+    }
+    lv_obj_invalidate(c->sheet);
+}
 
 static void qs_sheet_h_anim_exec(void* var, int32_t v)
 {
@@ -127,8 +163,16 @@ static void qs_sheet_h_anim_exec(void* var, int32_t v)
     if (c == nullptr) {
         return;
     }
-    c->sheet_h = static_cast<lv_coord_t>(v);
-    apply_sheet_geometry(c);
+    apply_sheet_geometry_drag(c, static_cast<lv_coord_t>(v));
+}
+
+static void qs_sheet_h_anim_completed(lv_anim_t* a)
+{
+    if (a == nullptr) {
+        return;
+    }
+    auto* c = static_cast<StickerChatQuickSettingsCtx*>(a->var);
+    apply_sheet_geometry_full(c);
 }
 
 /** 松手吸合/收起：时长随行程变化，避免短距离也拖很久。 */
@@ -152,34 +196,94 @@ static void qs_animate_sheet_h_to(StickerChatQuickSettingsCtx* c, lv_coord_t tar
     lv_anim_delete(c, qs_sheet_h_anim_exec);
     const lv_coord_t from = c->sheet_h;
     if (from == target_h) {
-        apply_sheet_geometry(c);
+        apply_sheet_geometry_full(c);
         return;
     }
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, c);
     lv_anim_set_exec_cb(&a, qs_sheet_h_anim_exec);
+    lv_anim_set_completed_cb(&a, qs_sheet_h_anim_completed);
     lv_anim_set_values(&a, static_cast<int32_t>(from), static_cast<int32_t>(target_h));
     lv_anim_set_duration(&a, qs_snap_duration_ms(from > target_h ? from - target_h : target_h - from, c->max_sheet_h));
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_start(&a);
 }
 
-static void apply_sheet_geometry(StickerChatQuickSettingsCtx* c)
+/** 跟手拖动 / 吸合动画：只改 sheet 高度 + 局部 invalidate，scrim 保持固定透明度。 */
+static void apply_sheet_geometry_drag(StickerChatQuickSettingsCtx* c, lv_coord_t new_h)
+{
+    if (c == nullptr || c->display == nullptr || c->scrim == nullptr || c->sheet == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(c->display);
+
+    lv_coord_t h = clamp_y(new_h, 0, c->max_sheet_h);
+    if (h > 0 && h < 8) {
+        h = 8;
+    }
+    if (h <= 0) {
+        if (c->sheet_h_painted > 0) {
+            lv_obj_t* parent = lv_obj_get_parent(c->sheet);
+            if (parent != nullptr) {
+                invalidate_height_band(parent, 0, c->sheet_h_painted);
+            }
+        }
+        lv_obj_add_flag(c->scrim, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(c->sheet, LV_OBJ_FLAG_HIDDEN);
+        c->sheet_h = 0;
+        c->sheet_h_painted = 0;
+        return;
+    }
+
+    const lv_coord_t old_h = c->sheet_h_painted;
+    const bool was_hidden = lv_obj_has_flag(c->sheet, LV_OBJ_FLAG_HIDDEN);
+
+    if (was_hidden) {
+        lv_obj_remove_flag(c->scrim, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(c->sheet, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_opa(c->scrim, kDragScrimOpa, 0);
+        lv_obj_move_foreground(c->scrim);
+        lv_obj_move_foreground(c->sheet);
+    }
+
+    lv_obj_set_height(c->sheet, h);
+    lv_obj_align(c->sheet, LV_ALIGN_TOP_MID, 0, 0);
+
+    if (was_hidden || old_h <= 0) {
+        lv_obj_invalidate(c->sheet);
+    } else {
+        invalidate_sheet_height_delta(c, old_h, h);
+    }
+
+    c->sheet_h = h;
+    c->sheet_h_painted = h;
+}
+
+/** 松手吸合结束或状态对齐：同步 scrim 透明度、宽度与 z-order。 */
+static void apply_sheet_geometry_full(StickerChatQuickSettingsCtx* c)
 {
     if (c == nullptr || c->display == nullptr || c->scrim == nullptr || c->sheet == nullptr) {
         return;
     }
     DisplayLockGuard lock(c->display);
     if (c->sheet_h <= 0) {
+        if (c->sheet_h_painted > 0) {
+            lv_obj_t* parent = lv_obj_get_parent(c->sheet);
+            if (parent != nullptr) {
+                invalidate_height_band(parent, 0, c->sheet_h_painted);
+            }
+        }
         lv_obj_add_flag(c->scrim, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(c->sheet, LV_OBJ_FLAG_HIDDEN);
+        c->sheet_h_painted = 0;
         return;
     }
+
     lv_obj_remove_flag(c->scrim, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(c->sheet, LV_OBJ_FLAG_HIDDEN);
 
-    lv_coord_t h = clamp_y(c->sheet_h, 8, c->max_sheet_h);
+    const lv_coord_t h = clamp_y(c->sheet_h, 8, c->max_sheet_h);
     c->sheet_h = h;
 
     lv_obj_set_height(c->sheet, h);
@@ -189,15 +293,18 @@ static void apply_sheet_geometry(StickerChatQuickSettingsCtx* c)
     lv_obj_move_foreground(c->scrim);
     lv_obj_move_foreground(c->sheet);
 
-    const int32_t max_opa = 160;
-    int32_t opa = (max_opa * static_cast<int32_t>(h)) / static_cast<int32_t>(c->max_sheet_h);
+    constexpr int32_t kMaxScrimOpa = 160;
+    int32_t opa = (kMaxScrimOpa * static_cast<int32_t>(h)) / static_cast<int32_t>(c->max_sheet_h);
     if (opa < 0) {
         opa = 0;
     }
-    if (opa > max_opa) {
-        opa = max_opa;
+    if (opa > kMaxScrimOpa) {
+        opa = kMaxScrimOpa;
     }
     lv_obj_set_style_bg_opa(c->scrim, static_cast<lv_opa_t>(opa), 0);
+    c->sheet_h_painted = h;
+    lv_obj_invalidate(c->scrim);
+    lv_obj_invalidate(c->sheet);
 }
 
 static void attach_drag_sources(lv_obj_t* obj, StickerChatQuickSettingsCtx* c);
@@ -232,12 +339,10 @@ static void on_gesture(lv_event_t* e)
                 }
             }
             if (c->phase == QsDragPhase::kOpening) {
-                c->sheet_h = clamp_y(y, 0, c->max_sheet_h);
-                apply_sheet_geometry(c);
+                apply_sheet_geometry_drag(c, clamp_y(y, 0, c->max_sheet_h));
             } else if (c->phase == QsDragPhase::kDragging) {
                 const lv_coord_t dy = y - c->press_y;
-                c->sheet_h = clamp_y(c->sheet_h_at_press + dy, 0, c->max_sheet_h);
-                apply_sheet_geometry(c);
+                apply_sheet_geometry_drag(c, clamp_y(c->sheet_h_at_press + dy, 0, c->max_sheet_h));
             }
             break;
         }
