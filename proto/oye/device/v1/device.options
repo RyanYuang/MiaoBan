@@ -1,0 +1,16 @@
+oye.device.v1.Envelope.payload max_size:512
+oye.device.v1.Envelope.error_message max_size:128
+oye.device.v1.Chunk.data max_size:512
+oye.device.v1.DeviceInfo.mac max_size:20
+oye.device.v1.DeviceInfo.uuid max_size:40
+oye.device.v1.DeviceInfo.board_name max_size:64
+oye.device.v1.DeviceInfo.fw_version max_size:32
+oye.device.v1.DeviceInfo.chip_model max_size:32
+oye.device.v1.OtaInfo.current_version max_size:32
+oye.device.v1.OtaInfo.new_version max_size:32
+oye.device.v1.OtaInfo.firmware_url max_size:256
+oye.device.v1.UserInfo.activation_code max_size:32
+oye.device.v1.UserInfo.activation_message max_size:256
+oye.device.v1.SetWifiRequest.ssid max_size:33
+oye.device.v1.SetWifiRequest.password max_size:64
+oye.device.v1.SetUserTokenRequest.access_token max_size:256

@@ -33,6 +33,7 @@ set(SOURCES "audio/audio_codec.cc"
             "system_info.cc"
             "application.cc"
             "ota.cc"
+            "ota_snapshot.cc"
             "settings.cc"
             "device_state_machine.cc"
             "assets.cc"
@@ -848,6 +849,19 @@ endif()
 if (CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING)
     list(APPEND SOURCES "boards/common/blufi.cpp")
 endif ()
+
+if(CONFIG_USE_OYE_BLE_PROVISIONING)
+    list(APPEND SOURCES
+        "ble/oye_ble_service.cc"
+        "ble/oye_ble_codec.cc"
+        "ble/oye_ble_commands.cc"
+        "ble/generated/oye/device/v1/device.pb.c"
+    )
+    list(APPEND INCLUDE_DIRS
+        "ble"
+        "ble/generated"
+    )
+endif()
 # Select language directory according to Kconfig
 if(CONFIG_LANGUAGE_ZH_CN)
     set(LANG_DIR "zh-CN")
@@ -984,6 +998,9 @@ if(CONFIG_IDF_TARGET_ESP32S3)
 endif()
 
 set(MAIN_PRIV_REQUIRES_EXTRA "")
+if(CONFIG_USE_OYE_BLE_PROVISIONING)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA nanopb)
+endif()
 if(CONFIG_BOARD_TYPE_ESP_VOCAT)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         espressif__touch_slider_sensor

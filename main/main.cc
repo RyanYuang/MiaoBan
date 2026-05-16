@@ -8,6 +8,9 @@
 #include <freertos/task.h>
 
 #include "application.h"
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+#include "ota_snapshot.h"
+#endif
 
 #define TAG "main"
 
@@ -21,6 +24,10 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+    OtaSnapshot::GetInstance().LoadFromNvs();
+#endif
 
     // Initialize and run the application
     auto& app = Application::GetInstance();

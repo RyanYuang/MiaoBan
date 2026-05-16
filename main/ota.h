@@ -14,12 +14,12 @@ public:
 
     esp_err_t CheckVersion();
     esp_err_t Activate();
-    bool HasActivationChallenge() { return has_activation_challenge_; }
-    bool HasNewVersion() { return has_new_version_; }
-    bool HasMqttConfig() { return has_mqtt_config_; }
-    bool HasWebsocketConfig() { return has_websocket_config_; }
-    bool HasActivationCode() { return has_activation_code_; }
-    bool HasServerTime() { return has_server_time_; }
+    bool HasActivationChallenge() const { return has_activation_challenge_; }
+    bool HasNewVersion() const { return has_new_version_; }
+    bool HasMqttConfig() const { return has_mqtt_config_; }
+    bool HasWebsocketConfig() const { return has_websocket_config_; }
+    bool HasActivationCode() const { return has_activation_code_; }
+    bool HasServerTime() const { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
     static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
     void MarkCurrentVersionValid();

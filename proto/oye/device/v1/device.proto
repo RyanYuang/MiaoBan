@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package oye.device.v1;
+
+enum Command {
+  CMD_UNKNOWN = 0;
+  CMD_GET_DEVICE_INFO = 1;
+  CMD_GET_OTA_INFO = 2;
+  CMD_GET_USER_INFO = 3;
+  CMD_SET_WIFI = 10;
+  CMD_SET_USER_TOKEN = 11;
+  CMD_REFRESH_OTA = 12;
+  CMD_START_PAIRING = 20;
+  CMD_UNPAIR = 21;
+}
+
+enum ErrorCode {
+  ERR_OK = 0;
+  ERR_INVALID_REQUEST = 1;
+  ERR_NOT_AUTHORIZED = 2;
+  ERR_BUSY = 3;
+  ERR_NO_NETWORK = 4;
+  ERR_INTERNAL = 5;
+}
+
+message Envelope {
+  uint32 schema_version = 1;
+  uint32 request_id = 2;
+  Command cmd = 3;
+  bytes payload = 4;
+  ErrorCode error = 5;
+  string error_message = 6;
+}
+
+message Chunk {
+  uint32 seq = 1;
+  uint32 total = 2;
+  bytes data = 3;
+}
+
+message DeviceInfo {
+  string mac = 1;
+  string uuid = 2;
+  string board_name = 3;
+  string fw_version = 4;
+  string chip_model = 5;
+}
+
+message OtaInfo {
+  string current_version = 1;
+  bool has_update = 2;
+  string new_version = 3;
+  string firmware_url = 4;
+  int64 last_check_epoch = 5;
+  bool needs_network = 6;
+}
+
+message UserInfo {
+  bool activated = 1;
+  string activation_code = 2;
+  string activation_message = 3;
+  bool has_token = 4;
+}
+
+message SetWifiRequest {
+  string ssid = 1;
+  string password = 2;
+}
+
+message SetUserTokenRequest {
+  string access_token = 1;
+}
+
+message Empty {}

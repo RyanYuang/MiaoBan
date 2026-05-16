@@ -858,6 +858,7 @@ menu "WiFi Configuration Method"
     config USE_HOTSPOT_WIFI_PROVISIONING
         bool "Hotspot"
         default y
+        depends on !USE_OYE_BLE_PROVISIONING
         help
             Use WiFi Hotspot to transmit WiFi configuration data
     config USE_ACOUSTIC_WIFI_PROVISIONING
@@ -873,6 +874,15 @@ menu "WiFi Configuration Method"
         select BT_BLE_42_FEATURES_SUPPORTED
         select BT_BLE_BLUFI_ENABLE
         select MBEDTLS_DHM_C
+
+    config USE_OYE_BLE_PROVISIONING
+        bool "Oye BLE (Protobuf)"
+        help
+            Use custom NimBLE GATT service with Protobuf for Wi-Fi provisioning,
+            device info, OTA metadata, and user token binding.
+        select BT_ENABLED
+        select BT_NIMBLE_ENABLED
+        depends on !USE_ESP_BLUFI_WIFI_PROVISIONING
 endmenu
 
 config AUDIO_DEBUG_UDP_SERVER

@@ -21,6 +21,9 @@
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
 #include "blufi.h"
 #endif
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+#include "ble/oye_ble_service.h"
+#endif
 
 static const char *TAG = "WifiBoard";
 
@@ -113,6 +116,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
 #endif
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+            OyeBleService::GetInstance().Stop();
+#endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
             break;
@@ -179,6 +185,17 @@ void WifiBoard::StartWifiConfigMode() {
     auto &blufi = Blufi::GetInstance();
     // initialize esp-blufi protocol
     blufi.init();
+#elif CONFIG_USE_OYE_BLE_PROVISIONING
+    auto& oye_ble = OyeBleService::GetInstance();
+    if (oye_ble.Start() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Oye BLE provisioning");
+    } else {
+        Application::GetInstance().Schedule([]() {
+            Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE,
+                                             "请使用手机蓝牙 App 连接本设备进行配网",
+                                             "gear", Lang::Sounds::OGG_WIFICONFIG);
+        });
+    }
 #endif
 #if CONFIG_USE_ACOUSTIC_WIFI_PROVISIONING
     // Start acoustic provisioning task

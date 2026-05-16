@@ -1,4 +1,5 @@
 #include "ota.h"
+#include "ota_snapshot.h"
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
@@ -67,6 +68,15 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     http->SetHeader("User-Agent", user_agent);
     http->SetHeader("Accept-Language", Lang::CODE);
     http->SetHeader("Content-Type", "application/json");
+
+    Settings user_settings("user", false);
+    std::string token = user_settings.GetString("access_token");
+    if (!token.empty()) {
+        if (token.find(' ') == std::string::npos) {
+            token = "Bearer " + token;
+        }
+        http->SetHeader("Authorization", token.c_str());
+    }
 
     return http;
 }
@@ -241,6 +251,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     cJSON_Delete(root);
+    OtaSnapshot::GetInstance().UpdateFromOta(*this);
     return ESP_OK;
 }
 
