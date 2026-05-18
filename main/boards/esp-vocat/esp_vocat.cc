@@ -12,6 +12,11 @@
 #include <esp_lvgl_port.h>
 #endif
 #include "application.h"
+#include "ui_page_ids.h"
+#include "ui_page_router.h"
+#if CONFIG_USE_OYE_CLOUD_API
+#include "meeting/meeting_emote_ui.h"
+#endif
 #include "button.h"
 #include "config.h"
 #include "backlight.h"
@@ -634,6 +639,7 @@ private:
             return;
         }
 
+        uint32_t press_start_ms = 0;
         while (true) {
             if (touchpad->WaitForTouchEvent()) {
                 auto &app = Application::GetInstance();
@@ -643,12 +649,31 @@ private:
                 touchpad->UpdateTouchPoint();
                 auto touch_event = touchpad->CheckTouchEvent();
 
-                if (touch_event == Cst816s::TOUCH_RELEASE) {
+                if (touch_event == Cst816s::TOUCH_PRESS) {
+                    press_start_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+                } else if (touch_event == Cst816s::TOUCH_RELEASE) {
                     if (app.GetDeviceState() == kDeviceStateStarting) {
                         board.EnterWifiConfigMode();
-                    } else {
-                        app.ToggleChatState();
+                        continue;
                     }
+#if CONFIG_USE_OYE_CLOUD_API
+                    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+                    const uint32_t held_ms = (press_start_ms > 0 && now_ms >= press_start_ms) ? (now_ms - press_start_ms) : 0;
+                    auto &meeting_ui = ui::meeting::MeetingEmoteUi::Instance();
+                    if (held_ms >= 800) {
+                        if (meeting_ui.IsActive()) {
+                            meeting_ui.StartRecordUpload();
+                        } else {
+                            UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Meeting));
+                        }
+                        continue;
+                    }
+                    if (meeting_ui.IsActive()) {
+                        meeting_ui.OnShortTap();
+                        continue;
+                    }
+#endif
+                    app.ToggleChatState();
                 }
             }
         }
