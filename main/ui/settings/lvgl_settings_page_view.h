@@ -24,6 +24,9 @@ public:
 
     void Show(const SettingsPageModel& model) override;
 
+    /** 在根节点 DELETE 时调用：释放 PNG/解码缓存，避免 internal 堆残留。 */
+    void ReleasePageAssets();
+
     void* RootHandle() const { return root_; }
 
     /** CreateRouterPageRoot 在 Show 前绑定，用于挂载 LVGL 触摸回调到 Presenter。 */

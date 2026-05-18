@@ -7,9 +7,12 @@
 #include "lvgl_theme.h"
 #include "settings_page_model.h"
 #include "settings_page_presenter.h"
+#include "system_info.h"
+#include "ui_page_router.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <src/misc/cache/instance/lv_image_cache.h>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -22,12 +25,88 @@ namespace {
 
 /** 与 `settings_page_presenter.cc` 中一致：点击该 label 进入贴图对话页。 */
 constexpr uintptr_t kUserDataOpenStickerChat = 0x53544348u;  // 'STCH'
+constexpr uintptr_t kUserDataOpenMeeting = 0x4D545047u;      // 'MTPG'
 
 /** 挂在根节点 user_data 上，根 DELETE 时一并释放 Presenter 与 View。 */
 struct SettingsMvpBundle {
     SettingsPagePresenter* presenter = nullptr;
     LvglSettingsPageView* view = nullptr;
+    bool swipe_active = false;
+    lv_coord_t swipe_x0 = 0;
+    lv_coord_t swipe_y0 = 0;
 };
+
+static void pointer_xy(lv_coord_t* out_x, lv_coord_t* out_y)
+{
+    if (out_x != nullptr) {
+        *out_x = 0;
+    }
+    if (out_y != nullptr) {
+        *out_y = 0;
+    }
+    lv_indev_t* indev = lv_indev_get_act();
+    if (indev == nullptr) {
+        return;
+    }
+    lv_point_t pt;
+    lv_indev_get_point(indev, &pt);
+    if (out_x != nullptr) {
+        *out_x = pt.x;
+    }
+    if (out_y != nullptr) {
+        *out_y = pt.y;
+    }
+}
+
+/** 从左向右水平滑动松手后返回上一页（与 WiFi / 会议页一致）。 */
+static void on_swipe_back_gesture(lv_event_t* e)
+{
+    auto* bundle = static_cast<SettingsMvpBundle*>(lv_event_get_user_data(e));
+    if (bundle == nullptr) {
+        return;
+    }
+
+    const lv_event_code_t code = lv_event_get_code(e);
+    lv_coord_t x = 0;
+    lv_coord_t y = 0;
+    pointer_xy(&x, &y);
+
+    switch (code) {
+        case LV_EVENT_PRESSED:
+            bundle->swipe_active = true;
+            bundle->swipe_x0 = x;
+            bundle->swipe_y0 = y;
+            break;
+        case LV_EVENT_RELEASED: {
+            if (!bundle->swipe_active) {
+                break;
+            }
+            const lv_coord_t dx = x - bundle->swipe_x0;
+            const lv_coord_t dy = y - bundle->swipe_y0;
+            const lv_coord_t ady = dy >= 0 ? dy : -dy;
+            bundle->swipe_active = false;
+            if (dx > 56 && dx > ady) {
+                UiPageRouter::Instance().NavigateBackFromInput();
+            }
+            break;
+        }
+        case LV_EVENT_PRESS_LOST:
+            bundle->swipe_active = false;
+            break;
+        default:
+            break;
+    }
+}
+
+static void attach_swipe_back(lv_obj_t* obj, SettingsMvpBundle* bundle)
+{
+    if (obj == nullptr || bundle == nullptr) {
+        return;
+    }
+    lv_obj_add_event_cb(obj, on_swipe_back_gesture, LV_EVENT_PRESSED, bundle);
+    lv_obj_add_event_cb(obj, on_swipe_back_gesture, LV_EVENT_RELEASED, bundle);
+    lv_obj_add_event_cb(obj, on_swipe_back_gesture, LV_EVENT_PRESS_LOST, bundle);
+}
 
 /** 根节点 LV_EVENT_DELETE：释放 MVP bundle，避免悬空指针与泄漏。 */
 static void SettingsRootOnDelete(lv_event_t* e)
@@ -40,10 +119,19 @@ static void SettingsRootOnDelete(lv_event_t* e)
     if (bundle == nullptr) {
         return;
     }
+    const InternalHeapStats before = SystemInfo::GetInternalHeapStats();
+    if (bundle->view != nullptr) {
+        bundle->view->ReleasePageAssets();
+    }
     delete bundle->presenter;
     delete bundle->view;
     delete bundle;
     lv_obj_set_user_data(root, nullptr);
+    const InternalHeapStats after = SystemInfo::GetInternalHeapStats();
+    const int delta_free = static_cast<int>(after.free_bytes) - static_cast<int>(before.free_bytes);
+    const int delta_largest = static_cast<int>(after.largest_block) - static_cast<int>(before.largest_block);
+    ESP_LOGI(TAG, "settings page freed: free %+d largest %+d (now free=%u largest=%u)", delta_free, delta_largest,
+             static_cast<unsigned>(after.free_bytes), static_cast<unsigned>(after.largest_block));
 }
 
 }  // namespace
@@ -59,7 +147,9 @@ void* LvglSettingsPageView::CreateRouterPageRoot(Display* display, LvglTheme* th
     view->BindTouchPresenter(presenter);
     SettingsPageModel model;
     model.title = "Settings";
+    SystemInfo::LogInternalHeap("settings before layout");
     presenter->Show(model);
+    SystemInfo::LogInternalHeap("settings after layout");
 
     lv_obj_t* root = static_cast<lv_obj_t*>(view->RootHandle());
     if (root == nullptr) {
@@ -71,6 +161,8 @@ void* LvglSettingsPageView::CreateRouterPageRoot(Display* display, LvglTheme* th
     auto* bundle = new SettingsMvpBundle{presenter, view};
     lv_obj_set_user_data(root, bundle);
     lv_obj_add_event_cb(root, SettingsRootOnDelete, LV_EVENT_DELETE, nullptr);
+    attach_swipe_back(root, bundle);
+    SystemInfo::LogInternalHeap("settings page created");
     return root;
 }
 
@@ -78,8 +170,20 @@ void* LvglSettingsPageView::CreateRouterPageRoot(Display* display, LvglTheme* th
 LvglSettingsPageView::LvglSettingsPageView(Display* display, LvglTheme* theme)
     : display_(display), theme_(theme) {}
 
+void LvglSettingsPageView::ReleasePageAssets() {
+    if (music_btn_image_ == nullptr) {
+        return;
+    }
+    const void* src = music_btn_image_->image_dsc();
+    if (src != nullptr) {
+        lv_image_cache_drop(src);
+    }
+    music_btn_image_.reset();
+}
+
 /** 根对象由 LVGL 销毁时不再 lv_obj_del；只清空成员指针。 */
 LvglSettingsPageView::~LvglSettingsPageView() {
+    ReleasePageAssets();
     root_ = nullptr;
 }
 
@@ -113,7 +217,14 @@ void LvglSettingsPageView::BuildLayout(const SettingsPageModel& model)
         void* asset_ptr = nullptr;
         size_t asset_size = 0;
         if (Assets::GetInstance().GetAssetData("Music_Btn.png", asset_ptr, asset_size) && asset_ptr != nullptr && asset_size > 0) {
-            auto* heap_copy = static_cast<uint8_t*>(heap_caps_malloc(asset_size, MALLOC_CAP_8BIT));
+            uint32_t alloc_caps = MALLOC_CAP_8BIT;
+#if CONFIG_SPIRAM
+            alloc_caps |= MALLOC_CAP_SPIRAM;
+#endif
+            auto* heap_copy = static_cast<uint8_t*>(heap_caps_malloc(asset_size, alloc_caps));
+            if (heap_copy == nullptr && (alloc_caps & MALLOC_CAP_SPIRAM) != 0) {
+                heap_copy = static_cast<uint8_t*>(heap_caps_malloc(asset_size, MALLOC_CAP_8BIT));
+            }
             if (heap_copy != nullptr) {
                 memcpy(heap_copy, asset_ptr, asset_size);
                 try {
@@ -140,14 +251,27 @@ void LvglSettingsPageView::BuildLayout(const SettingsPageModel& model)
     lv_label_set_text(sticker_entry, "贴图对话");
     lv_obj_set_style_text_font(sticker_entry, theme_->text_font()->font(), 0);
     lv_obj_set_style_text_color(sticker_entry, theme_->text_color(), 0);
-    lv_obj_align(sticker_entry, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_align(sticker_entry, LV_ALIGN_BOTTOM_MID, 0, -36);
     lv_obj_add_flag(sticker_entry, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_user_data(sticker_entry, reinterpret_cast<void*>(kUserDataOpenStickerChat));
+
+#if CONFIG_USE_OYE_CLOUD_API
+    lv_obj_t* meeting_entry = lv_label_create(panel);
+    lv_label_set_text(meeting_entry, "会议纪要");
+    lv_obj_set_style_text_font(meeting_entry, theme_->text_font()->font(), 0);
+    lv_obj_set_style_text_color(meeting_entry, theme_->text_color(), 0);
+    lv_obj_align(meeting_entry, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_add_flag(meeting_entry, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_user_data(meeting_entry, reinterpret_cast<void*>(kUserDataOpenMeeting));
+#endif
 
     if (touch_presenter_ != nullptr) {
         ui::mvp::LvglPageAttachTouchHandlers(panel, touch_presenter_);
         ui::mvp::LvglPageAttachTouchHandlers(label, touch_presenter_);
         ui::mvp::LvglPageAttachTouchHandlers(sticker_entry, touch_presenter_);
+#if CONFIG_USE_OYE_CLOUD_API
+        ui::mvp::LvglPageAttachTouchHandlers(meeting_entry, touch_presenter_);
+#endif
     }
 
     root_ = panel;
