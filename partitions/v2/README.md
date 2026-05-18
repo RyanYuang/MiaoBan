@@ -35,9 +35,9 @@ The `assets` partition stores:
 - `nvs`: 16KB (non-volatile storage)
 - `otadata`: 8KB (OTA data)
 - `phy_init`: 4KB (PHY initialization data)
-- `ota_0`: 4MB (application partition 0)
-- `ota_1`: 4MB (application partition 1)
-- `assets`: 8MB (network-loadable assets)
+- `ota_0`: 4.25MB (application partition 0)
+- `ota_1`: 4.25MB (application partition 1)
+- `assets`: ~7.88MB (network-loadable assets)
 
 ## Available Configurations
 
@@ -53,9 +53,9 @@ The `assets` partition stores:
 - `nvs`: 16KB
 - `otadata`: 8KB
 - `phy_init`: 4KB
-- `ota_0`: 4MB
-- `ota_1`: 4MB
-- `assets`: 8MB
+- `ota_0`: 4.25MB
+- `ota_1`: 4.25MB
+- `assets`: ~7.88MB
 
 ### 16MB Flash Devices (`16m_c3.csv`) - ESP32-C3 Optimized
 - `nvs`: 16KB

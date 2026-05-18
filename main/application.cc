@@ -21,6 +21,10 @@
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+#include "ble/oye_ble_service.h"
+#endif
+
 namespace {
 constexpr char TAG[] = "Application";
 }
@@ -378,6 +382,15 @@ void Application::HandleActivationDoneEvent() {
 
     // Release OTA object after activation is complete
     ota_.reset();
+
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+    if (!OyeBleService::GetInstance().IsRunning()) {
+        if (OyeBleService::GetInstance().Start() != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start Oye BLE service after activation");
+        }
+    }
+#endif
+
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 

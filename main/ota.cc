@@ -19,11 +19,18 @@
 #endif
 
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <sstream>
 #include <algorithm>
 
 #define TAG "Ota"
+
+namespace {
+std::mutex g_check_version_mutex;
+
+constexpr size_t kMinFreeInternalForHttp = 16384;
+}  // namespace
 
 
 Ota::Ota() {
@@ -85,6 +92,18 @@ std::unique_ptr<Http> Ota::SetupHttp() {
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
 esp_err_t Ota::CheckVersion() {
+    std::unique_lock<std::mutex> lock(g_check_version_mutex, std::defer_lock);
+    if (!lock.try_lock()) {
+        ESP_LOGW(TAG, "CheckVersion already in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < kMinFreeInternalForHttp) {
+        ESP_LOGW(TAG, "CheckVersion skipped: low internal heap (%u bytes free)",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+        return ESP_ERR_NO_MEM;
+    }
+
     auto& board = Board::GetInstance();
     auto app_desc = esp_app_get_description();
 

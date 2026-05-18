@@ -30,6 +30,14 @@ static const char *TAG = "WifiBoard";
 // Connection timeout in seconds
 static constexpr int CONNECT_TIMEOUT_SEC = 60;
 
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+static void EnsureOyeBleStarted() {
+    if (OyeBleService::GetInstance().Start() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Oye BLE service");
+    }
+}
+#endif
+
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
     esp_timer_create_args_t timer_args = {
@@ -116,9 +124,6 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
 #endif
-#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
-            OyeBleService::GetInstance().Stop();
-#endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
             break;
@@ -186,16 +191,12 @@ void WifiBoard::StartWifiConfigMode() {
     // initialize esp-blufi protocol
     blufi.init();
 #elif CONFIG_USE_OYE_BLE_PROVISIONING
-    auto& oye_ble = OyeBleService::GetInstance();
-    if (oye_ble.Start() != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start Oye BLE provisioning");
-    } else {
-        Application::GetInstance().Schedule([]() {
-            Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE,
-                                             "请使用手机蓝牙 App 连接本设备进行配网",
-                                             "gear", Lang::Sounds::OGG_WIFICONFIG);
-        });
-    }
+    EnsureOyeBleStarted();
+    Application::GetInstance().Schedule([]() {
+        Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE,
+                                         "请使用手机蓝牙 App 连接本设备进行配网",
+                                         "gear", Lang::Sounds::OGG_WIFICONFIG);
+    });
 #endif
 #if CONFIG_USE_ACOUSTIC_WIFI_PROVISIONING
     // Start acoustic provisioning task

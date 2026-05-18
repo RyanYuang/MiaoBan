@@ -1,7 +1,10 @@
 #include "oye_ble_commands.h"
 
+#include "application.h"
 #include <board.h>
-#include <esp_app_format.h>
+#include <esp_heap_caps.h>
+#include <esp_app_desc.h>
+#include <pb_decode.h>
 #include <pb_encode.h>
 #include <ssid_manager.h>
 #include <system_info.h>
@@ -138,7 +141,23 @@ void HandleRefreshOta(oye_device_v1_Envelope& response) {
         SetError(response, oye_device_v1_ErrorCode_ERR_NO_NETWORK, "Wi-Fi not connected");
         return;
     }
+    if (Application::GetInstance().GetDeviceState() == kDeviceStateActivating) {
+        SetError(response, oye_device_v1_ErrorCode_ERR_BUSY, "activation in progress");
+        return;
+    }
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 16384) {
+        SetError(response, oye_device_v1_ErrorCode_ERR_BUSY, "low memory");
+        return;
+    }
     esp_err_t err = OtaSnapshot::GetInstance().RefreshFromServer();
+    if (err == ESP_ERR_INVALID_STATE) {
+        SetError(response, oye_device_v1_ErrorCode_ERR_BUSY, "ota check in progress");
+        return;
+    }
+    if (err == ESP_ERR_NO_MEM) {
+        SetError(response, oye_device_v1_ErrorCode_ERR_BUSY, "low memory");
+        return;
+    }
     if (err != ESP_OK) {
         SetError(response, oye_device_v1_ErrorCode_ERR_INTERNAL, "CheckVersion failed");
         return;

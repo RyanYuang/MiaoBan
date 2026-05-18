@@ -5,6 +5,18 @@
 
 #define TAG "AfeAudioProcessor"
 
+static void DrainAfeRingbuffer(const esp_afe_sr_iface_t* iface, esp_afe_sr_data_t* data) {
+    if (iface == nullptr || data == nullptr) {
+        return;
+    }
+    for (int i = 0; i < 64; ++i) {
+        auto res = iface->fetch_with_delay(data, 0);
+        if (res == nullptr || res->ret_value == ESP_FAIL) {
+            break;
+        }
+    }
+}
+
 AfeAudioProcessor::AfeAudioProcessor()
     : afe_data_(nullptr) {
     event_group_ = xEventGroupCreate();
@@ -71,7 +83,7 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 4096, this, 8, NULL);
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
@@ -112,6 +124,7 @@ void AfeAudioProcessor::Start() {
 
 void AfeAudioProcessor::Stop() {
     xEventGroupClearBits(event_group_, PROCESSOR_RUNNING);
+    DrainAfeRingbuffer(afe_iface_, afe_data_);
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
     if (afe_data_ != nullptr) {
@@ -141,45 +154,43 @@ void AfeAudioProcessor::AudioProcessorTask() {
     while (true) {
         xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
-        if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {
-            continue;
-        }
-        if (res == nullptr || res->ret_value == ESP_FAIL) {
-            if (res != nullptr) {
-                ESP_LOGI(TAG, "Error code: %d", res->ret_value);
+        while (xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) {
+            auto res = afe_iface_->fetch_with_delay(afe_data_, pdMS_TO_TICKS(50));
+            if (res == nullptr || res->ret_value == ESP_FAIL) {
+                break;
             }
-            continue;
-        }
 
-        // VAD state change
-        if (vad_state_change_callback_) {
-            if (res->vad_state == VAD_SPEECH && !is_speaking_) {
-                is_speaking_ = true;
-                vad_state_change_callback_(true);
-            } else if (res->vad_state == VAD_SILENCE && is_speaking_) {
-                is_speaking_ = false;
-                vad_state_change_callback_(false);
+            // VAD state change
+            if (vad_state_change_callback_) {
+                if (res->vad_state == VAD_SPEECH && !is_speaking_) {
+                    is_speaking_ = true;
+                    vad_state_change_callback_(true);
+                } else if (res->vad_state == VAD_SILENCE && is_speaking_) {
+                    is_speaking_ = false;
+                    vad_state_change_callback_(false);
+                }
             }
-        }
 
-        if (output_callback_) {
-            size_t samples = res->data_size / sizeof(int16_t);
-            
-            // Add data to buffer
-            output_buffer_.insert(output_buffer_.end(), res->data, res->data + samples);
-            
-            // Output complete frames when buffer has enough data
-            while (output_buffer_.size() >= frame_samples_) {
-                if (output_buffer_.size() == frame_samples_) {
-                    // If buffer size equals frame size, move the entire buffer
-                    output_callback_(std::move(output_buffer_));
-                    output_buffer_.clear();
-                    output_buffer_.reserve(frame_samples_);
-                } else {
-                    // If buffer size exceeds frame size, copy one frame and remove it
-                    output_callback_(std::vector<int16_t>(output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
-                    output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
+            if (output_callback_) {
+                size_t samples = res->data_size / sizeof(int16_t);
+
+                // Add data to buffer
+                output_buffer_.insert(output_buffer_.end(), res->data, res->data + samples);
+
+                // Output complete frames when buffer has enough data
+                while (output_buffer_.size() >= frame_samples_) {
+                    if (output_buffer_.size() == frame_samples_) {
+                        // If buffer size equals frame size, move the entire buffer
+                        output_callback_(std::move(output_buffer_));
+                        output_buffer_.clear();
+                        output_buffer_.reserve(frame_samples_);
+                    } else {
+                        // If buffer size exceeds frame size, copy one frame and remove it
+                        output_callback_(std::vector<int16_t>(output_buffer_.begin(),
+                                                               output_buffer_.begin() + frame_samples_));
+                        output_buffer_.erase(output_buffer_.begin(),
+                                             output_buffer_.begin() + frame_samples_);
+                    }
                 }
             }
         }

@@ -2,6 +2,8 @@
 
 固件通过 **NimBLE GATT** 承载 **Protobuf（nanopb）** 消息，用于手机配对、Wi‑Fi 配网、读取 OTA 元数据与用户绑定信息。固件大包升级仍走 **HTTP OTA**（`Ota::CheckVersion` / `StartUpgrade`），不经 BLE 传固件。
 
+**手机 App 开发**请阅读：[oye-ble-mobile-app_zh.md](./oye-ble-mobile-app_zh.md)（扫描、配对、分片、命令与完整业务流程）。
+
 ## 启用方式
 
 - menuconfig：`WiFi Configuration Method` → **Oye BLE (Protobuf)**（`CONFIG_USE_OYE_BLE_PROVISIONING`）

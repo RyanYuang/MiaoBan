@@ -7,6 +7,18 @@
 
 #define TAG "AfeWakeWord"
 
+static void DrainAfeRingbuffer(const esp_afe_sr_iface_t* iface, esp_afe_sr_data_t* data) {
+    if (iface == nullptr || data == nullptr) {
+        return;
+    }
+    for (int i = 0; i < 64; ++i) {
+        auto res = iface->fetch_with_delay(data, 0);
+        if (res == nullptr || res->ret_value == ESP_FAIL) {
+            break;
+        }
+    }
+}
+
 AfeWakeWord::AfeWakeWord()
     : afe_data_(nullptr),
       wake_word_pcm_(),
@@ -74,7 +86,7 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
     afe_config->afe_perferred_core = 1;
-    afe_config->afe_perferred_priority = 1;
+    afe_config->afe_perferred_priority = 5;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     
     afe_iface_ = esp_afe_handle_from_config(afe_config);
@@ -84,7 +96,7 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();
         vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 3, nullptr);
+    }, "audio_detection", 4096, this, 8, nullptr);
 
     return true;
 }
@@ -99,6 +111,7 @@ void AfeWakeWord::Start() {
 
 void AfeWakeWord::Stop() {
     xEventGroupClearBits(event_group_, DETECTION_RUNNING_EVENT);
+    DrainAfeRingbuffer(afe_iface_, afe_data_);
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
     if (afe_data_ != nullptr) {
@@ -141,20 +154,23 @@ void AfeWakeWord::AudioDetectionTask() {
     while (true) {
         xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
-        if (res == nullptr || res->ret_value == ESP_FAIL) {
-            continue;;
-        }
+        while (xEventGroupGetBits(event_group_) & DETECTION_RUNNING_EVENT) {
+            auto res = afe_iface_->fetch_with_delay(afe_data_, pdMS_TO_TICKS(50));
+            if (res == nullptr || res->ret_value == ESP_FAIL) {
+                break;
+            }
 
-        // Store the wake word data for voice recognition, like who is speaking
-        StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
+            // Store the wake word data for voice recognition, like who is speaking
+            StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
 
-        if (res->wakeup_state == WAKENET_DETECTED) {
-            Stop();
-            last_detected_wake_word_ = wake_words_[res->wakenet_model_index - 1];
+            if (res->wakeup_state == WAKENET_DETECTED) {
+                Stop();
+                last_detected_wake_word_ = wake_words_[res->wakenet_model_index - 1];
 
-            if (wake_word_detected_callback_) {
-                wake_word_detected_callback_(last_detected_wake_word_);
+                if (wake_word_detected_callback_) {
+                    wake_word_detected_callback_(last_detected_wake_word_);
+                }
+                break;
             }
         }
     }
