@@ -134,6 +134,10 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
+    /** Optional tap on processor PCM (16 kHz) before Opus encode; used by Oye cloud ASR. */
+    void SetPcmTap(std::function<void(const std::vector<int16_t>&)> tap);
+    void ClearPcmTap();
+
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
@@ -179,6 +183,7 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    std::function<void(const std::vector<int16_t>&)> pcm_tap_;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

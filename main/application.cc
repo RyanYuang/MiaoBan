@@ -24,6 +24,11 @@
 #ifdef CONFIG_USE_OYE_BLE_PROVISIONING
 #include "ble/oye_ble_service.h"
 #endif
+#if CONFIG_USE_OYE_CLOUD_API
+#include "oye/oye_cloud_api.h"
+#include "oye/oye_config.h"
+#include "protocols/oye_chat_protocol.h"
+#endif
 
 namespace {
 constexpr char TAG[] = "Application";
@@ -413,6 +418,17 @@ void Application::ActivationTask() {
     // Check for new firmware version
     CheckNewVersion();
 
+#if CONFIG_USE_OYE_CLOUD_API
+    if (oye::HasAccessToken()) {
+        oye::UserInfo user;
+        if (oye::GetCurrentUser(user) == ESP_OK) {
+            ESP_LOGI(TAG, "Oye user ok: %s (%s)", user.nickname.c_str(), user.phone.c_str());
+        } else {
+            ESP_LOGW(TAG, "Oye token invalid, voice/chat may fail until App rebinds");
+        }
+    }
+#endif
+
     // Initialize the protocol
     InitializeProtocol();
 
@@ -575,6 +591,14 @@ void Application::InitializeProtocol() {
         display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
     });
 
+#if CONFIG_USE_OYE_CLOUD_API
+    if (oye::HasAccessToken()) {
+        auto oye_proto = std::make_unique<OyeChatProtocol>();
+        oye_proto->SetMainScheduler([this](std::function<void()> fn) { Schedule(std::move(fn)); });
+        protocol_ = std::move(oye_proto);
+        ESP_LOGI(TAG, "Using Oye cloud HTTP voice protocol");
+    } else
+#endif
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {

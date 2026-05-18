@@ -214,6 +214,18 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGI(TAG, "No websocket section found!");
     }
 
+    cJSON* oye = cJSON_GetObjectItem(root, "oye");
+    if (cJSON_IsObject(oye)) {
+        Settings settings("oye", true);
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, oye) {
+            if (cJSON_IsString(item)) {
+                settings.SetString(item->string, item->valuestring);
+            }
+        }
+        ESP_LOGI(TAG, "Oye cloud config updated from OTA");
+    }
+
     has_server_time_ = false;
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsObject(server_time)) {

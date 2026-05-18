@@ -295,6 +295,10 @@ void McpServer::AddUserOnlyTools() {
                 settings.SetString("download_url", url);
                 return true;
             });
+
+#if CONFIG_USE_OYE_CLOUD_API
+    AddOyeCloudTools();
+#endif
 }
 
 void McpServer::AddTool(McpTool* tool) {

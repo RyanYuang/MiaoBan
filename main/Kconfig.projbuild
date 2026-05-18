@@ -885,6 +885,21 @@ menu "WiFi Configuration Method"
         depends on !USE_ESP_BLUFI_WIFI_PROVISIONING
 endmenu
 
+config USE_OYE_CLOUD_API
+    bool "Oye cloud HTTP API (chat, meeting, voiceprint)"
+    default y
+    depends on USE_OYE_BLE_PROVISIONING
+    help
+        When user access_token is present, use Oye backend for voice dialog
+        (meeting WS ASR + HTTP chat) instead of Xiaozhi MQTT/WebSocket Opus.
+
+config OYE_API_BASE_URL
+    string "Oye API base URL"
+    default "http://192.168.11.7:8000"
+    depends on USE_OYE_CLOUD_API
+    help
+        Base URL without /api/v1 suffix, e.g. http://192.168.11.7:8000
+
 config AUDIO_DEBUG_UDP_SERVER
     string "Audio Debug UDP Server Address"
     default "192.168.2.100:8000"

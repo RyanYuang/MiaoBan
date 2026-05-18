@@ -101,6 +101,9 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        if (pcm_tap_) {
+            pcm_tap_(data);
+        }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
@@ -767,4 +770,12 @@ bool AudioService::IsAfeWakeWord() {
 #else
     return false;
 #endif
+}
+
+void AudioService::SetPcmTap(std::function<void(const std::vector<int16_t>&)> tap) {
+    pcm_tap_ = std::move(tap);
+}
+
+void AudioService::ClearPcmTap() {
+    pcm_tap_ = nullptr;
 }

@@ -862,6 +862,19 @@ if(CONFIG_USE_OYE_BLE_PROVISIONING)
         "ble/generated"
     )
 endif()
+
+if(CONFIG_USE_OYE_CLOUD_API)
+    list(APPEND SOURCES
+        "oye/oye_config.cc"
+        "oye/oye_http.cc"
+        "oye/oye_cloud_api.cc"
+        "oye/oye_meeting_stream.cc"
+        "oye/oye_audio_util.cc"
+        "oye/oye_mcp_tools.cc"
+        "protocols/oye_chat_protocol.cc"
+    )
+    list(APPEND INCLUDE_DIRS "oye")
+endif()
 # Select language directory according to Kconfig
 if(CONFIG_LANGUAGE_ZH_CN)
     set(LANG_DIR "zh-CN")

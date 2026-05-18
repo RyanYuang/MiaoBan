@@ -319,6 +319,7 @@ public:
     }
 
     void AddCommonTools();
+    void AddOyeCloudTools();
     void AddUserOnlyTools();
     void AddTool(McpTool* tool);
     void AddTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback);
