@@ -1,6 +1,7 @@
 #include "system_info.h"
 
 #include <freertos/task.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_flash.h>
 #include <esp_mac.h>
@@ -145,10 +146,24 @@ void SystemInfo::PrintTaskList() {
     ESP_LOGI(TAG, "Task list: \n%s", buffer);
 }
 
+InternalHeapStats SystemInfo::GetInternalHeapStats() {
+    InternalHeapStats stats;
+    stats.free_bytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    stats.largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    stats.min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    return stats;
+}
+
+void SystemInfo::LogInternalHeap(const char* label) {
+    const InternalHeapStats stats = GetInternalHeapStats();
+    ESP_LOGI(TAG, "%s: free=%u largest=%u min=%u", label, static_cast<unsigned>(stats.free_bytes),
+             static_cast<unsigned>(stats.largest_block), static_cast<unsigned>(stats.min_free_bytes));
+}
+
 void SystemInfo::PrintHeapStats() {
-    int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
+    const InternalHeapStats stats = GetInternalHeapStats();
+    ESP_LOGI(TAG, "free sram: %u largest: %u minimal sram: %u", static_cast<unsigned>(stats.free_bytes),
+             static_cast<unsigned>(stats.largest_block), static_cast<unsigned>(stats.min_free_bytes));
 }
 
 void SystemInfo::PrintPmLocks() {

@@ -314,8 +314,8 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
         
-            // Print debug info every 10 seconds
-            if (clock_ticks_ % 10 == 0) {
+            // Print heap stats every 2 seconds (1Hz clock tick)
+            if (clock_ticks_ % 2 == 0) {
                 SystemInfo::PrintHeapStats();
             }
         }
