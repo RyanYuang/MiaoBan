@@ -41,6 +41,7 @@ esp_err_t UploadMeetingAudio(const uint8_t* wav_data, size_t wav_size, const std
                              int& meeting_id);
 esp_err_t SubmitMeetingTranscript(const std::string& title, const std::string& transcript,
                                   int& meeting_id);
+esp_err_t ListMeetings(int page, int page_size, std::vector<MeetingInfo>& out);
 esp_err_t GetMeeting(int meeting_id, MeetingInfo& out);
 esp_err_t PollMeetingUntilDone(int meeting_id, MeetingInfo& out, int timeout_sec = 300);
 

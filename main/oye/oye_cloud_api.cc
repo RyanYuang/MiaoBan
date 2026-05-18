@@ -133,6 +133,7 @@ esp_err_t SendChatMessage(int session_id, const std::string& user_text, ChatMess
 
 static esp_err_t ParseMeeting(const cJSON* data, MeetingInfo& out) {
     if (data == nullptr) {
+        ESP_LOGW(TAG, "ParseMeeting: data is null");
         return ESP_FAIL;
     }
     auto id = cJSON_GetObjectItem(data, "id");
@@ -159,20 +160,27 @@ static esp_err_t ParseMeeting(const cJSON* data, MeetingInfo& out) {
     if (cJSON_IsString(err)) {
         out.error_message = err->valuestring;
     }
+    if (out.id <= 0) {
+        ESP_LOGW(TAG, "ParseMeeting: invalid id");
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
 esp_err_t UploadMeetingAudio(const uint8_t* wav_data, size_t wav_size, const std::string& title,
                              int& meeting_id) {
+    ESP_LOGI(TAG, "POST /meetings/upload title=%s wav_bytes=%u", title.c_str(),
+             static_cast<unsigned>(wav_size));
     auto res = RequestMultipart("/meetings/upload", "audio", "meet.wav", "audio/wav", wav_data,
                                 wav_size, "title", title);
     if (!res.Ok() || res.data == nullptr) {
-        ESP_LOGE(TAG, "upload meeting failed code=%d", res.code);
+        ESP_LOGE(TAG, "upload meeting failed code=%d msg=%s", res.code, res.message.c_str());
         return ESP_FAIL;
     }
     MeetingInfo info;
     ParseMeeting(res.data, info);
     meeting_id = info.id;
+    ESP_LOGI(TAG, "upload meeting ok id=%d status=%s", meeting_id, info.status.c_str());
     return meeting_id > 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -197,32 +205,112 @@ esp_err_t SubmitMeetingTranscript(const std::string& title, const std::string& t
     return meeting_id > 0 ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t GetMeeting(int meeting_id, MeetingInfo& out) {
-    std::string path = "/meetings/" + std::to_string(meeting_id);
+esp_err_t ListMeetings(int page, int page_size, std::vector<MeetingInfo>& out) {
+    out.clear();
+    std::string path = "/meetings?page=" + std::to_string(page) + "&page_size=" + std::to_string(page_size);
+    ESP_LOGI(TAG, "ListMeetings begin page=%d page_size=%d", page, page_size);
     auto res = RequestJson("GET", path);
+    ESP_LOGI(TAG, "ListMeetings response http=%d biz_code=%d ok=%d msg=%s data=%s", res.http_status,
+             res.code, res.Ok() ? 1 : 0, res.message.c_str(), res.data != nullptr ? "yes" : "no");
     if (!res.Ok()) {
+        if (res.code == 5002) {
+            ESP_LOGE(TAG,
+                     "ListMeetings: HTTP headers timeout (http=%d). Backend may show 200 but MCU "
+                     "did not receive response.",
+                     res.http_status);
+        } else if (res.code == 5001) {
+            ESP_LOGE(TAG, "ListMeetings: skipped, internal heap too low");
+        } else if (res.message == "open failed") {
+            ESP_LOGE(TAG, "ListMeetings: TCP connect failed (often lwip out of memory / DNS)");
+        } else {
+            ESP_LOGE(TAG, "ListMeetings: biz not ok (http=%d code=%d msg=%s)", res.http_status, res.code,
+                     res.message.c_str());
+        }
         return ESP_FAIL;
     }
-    return ParseMeeting(res.data, out);
+    if (res.data == nullptr) {
+        ESP_LOGE(TAG, "ListMeetings: data is null despite biz_code=0");
+        return ESP_FAIL;
+    }
+    auto items = cJSON_GetObjectItem(res.data, "items");
+    if (!cJSON_IsArray(items)) {
+        auto total = cJSON_GetObjectItem(res.data, "total");
+        ESP_LOGE(TAG, "ListMeetings: data.items missing (data keys: items=%d total=%d)", items != nullptr ? 1 : 0,
+                 cJSON_IsNumber(total) ? 1 : 0);
+        return ESP_FAIL;
+    }
+    const int n = cJSON_GetArraySize(items);
+    auto total = cJSON_GetObjectItem(res.data, "total");
+    if (cJSON_IsNumber(total)) {
+        ESP_LOGI(TAG, "ListMeetings: items array size=%d total=%d", n, total->valueint);
+    } else {
+        ESP_LOGI(TAG, "ListMeetings: items array size=%d (no total field)", n);
+    }
+    out.reserve(static_cast<size_t>(n > page_size ? page_size : n));
+    for (int i = 0; i < n; ++i) {
+        auto* item = cJSON_GetArrayItem(items, i);
+        if (item == nullptr) {
+            ESP_LOGW(TAG, "ListMeetings: items[%d] is null", i);
+            continue;
+        }
+        MeetingInfo info;
+        if (ParseMeeting(item, info) == ESP_OK) {
+            ESP_LOGI(TAG, "ListMeetings: [%d] id=%d title=%s status=%s", i, info.id, info.title.c_str(),
+                     info.status.c_str());
+            out.push_back(std::move(info));
+        } else {
+            ESP_LOGW(TAG, "ListMeetings: [%d] parse skipped", i);
+        }
+    }
+    ESP_LOGI(TAG, "ListMeetings done: parsed %u/%d", static_cast<unsigned>(out.size()), n);
+    return ESP_OK;
+}
+
+esp_err_t GetMeeting(int meeting_id, MeetingInfo& out) {
+    std::string path = "/meetings/" + std::to_string(meeting_id);
+    ESP_LOGI(TAG, "GetMeeting begin id=%d", meeting_id);
+    auto res = RequestJson("GET", path);
+    ESP_LOGI(TAG, "GetMeeting response http=%d biz_code=%d ok=%d msg=%s data=%s", res.http_status,
+             res.code, res.Ok() ? 1 : 0, res.message.c_str(), res.data != nullptr ? "yes" : "no");
+    if (!res.Ok()) {
+        ESP_LOGE(TAG, "GetMeeting %d: biz not ok", meeting_id);
+        return ESP_FAIL;
+    }
+    if (ParseMeeting(res.data, out) != ESP_OK) {
+        ESP_LOGE(TAG, "GetMeeting %d: parse data failed", meeting_id);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "GetMeeting %d ok status=%s title=%s", meeting_id, out.status.c_str(),
+             out.title.c_str());
+    return ESP_OK;
 }
 
 esp_err_t PollMeetingUntilDone(int meeting_id, MeetingInfo& out, int timeout_sec) {
+    ESP_LOGI(TAG, "poll meeting %d timeout=%ds", meeting_id, timeout_sec);
     const int interval_ms = 3000;
     int elapsed_ms = 0;
+    int round = 0;
     while (elapsed_ms < timeout_sec * 1000) {
+        ++round;
         if (GetMeeting(meeting_id, out) != ESP_OK) {
+            ESP_LOGE(TAG, "poll meeting %d: GetMeeting failed at round %d", meeting_id, round);
             return ESP_FAIL;
         }
+        ESP_LOGI(TAG, "poll meeting %d round %d status=%s elapsed=%dms", meeting_id, round,
+                 out.status.c_str(), elapsed_ms);
         if (out.status == "done") {
+            ESP_LOGI(TAG, "poll meeting %d done after %d round(s)", meeting_id, round);
             return ESP_OK;
         }
         if (out.status == "failed") {
-            ESP_LOGE(TAG, "meeting failed: %s", out.error_message.c_str());
+            ESP_LOGE(TAG, "meeting %d failed: %s", meeting_id, out.error_message.c_str());
             return ESP_FAIL;
         }
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
         elapsed_ms += interval_ms;
     }
+    ESP_LOGW(TAG, "poll meeting %d timeout after %d round(s), last status=%s", meeting_id, round,
+             out.status.c_str());
     return ESP_ERR_TIMEOUT;
 }
 
