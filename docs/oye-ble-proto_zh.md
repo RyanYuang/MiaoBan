@@ -30,6 +30,7 @@
 | `CMD_GET_DEVICE_INFO` | 1 | 设备信息 | 否 |
 | `CMD_GET_OTA_INFO` | 2 | OTA 缓存元数据 | 否 |
 | `CMD_GET_USER_INFO` | 3 | 激活/Token 状态 | 否 |
+| `CMD_GET_WIFI` | 4 | 当前 Wi‑Fi 状态（`WifiInfo`，不含密码） | 否 |
 | `CMD_SET_WIFI` | 10 | 下发 SSID/密码 | 是 |
 | `CMD_SET_USER_TOKEN` | 11 | 写入 NVS `user.access_token` | 是 |
 | `CMD_REFRESH_OTA` | 12 | 联网时 HTTP `CheckVersion` | 否 |
@@ -48,10 +49,11 @@
 
 1. 扫描并连接 `Oye-*`，完成 LE 配对（Bond）
 2. `CMD_GET_DEVICE_INFO`
-3. `CMD_SET_WIFI`（Bond 后）
-4. 等待设备 Wi‑Fi 连接（设备侧会关闭 BLE 广播）
-5. 再次连接或事先缓存：`CMD_REFRESH_OTA` → `CMD_GET_OTA_INFO` / `CMD_GET_USER_INFO`
-6. `CMD_SET_USER_TOKEN` 绑定账号
+3. `CMD_GET_WIFI`（可选，展示当前连接/已保存网络）
+4. `CMD_SET_WIFI`（Bond 后）
+5. 等待设备 Wi‑Fi 连接（设备侧会关闭 BLE 广播）
+6. 再次连接或事先缓存：`CMD_REFRESH_OTA` → `CMD_GET_OTA_INFO` / `CMD_GET_USER_INFO`
+7. `CMD_SET_USER_TOKEN` 绑定账号
 
 ## 与 HTTP OTA 的关系
 
@@ -62,6 +64,7 @@
 ## 4.3C 实机验证清单
 
 - [ ] 无已存 Wi‑Fi 冷启动：出现 BLE 广播，无 Hotspot `Xiaozhi-*`
+- [ ] `GET_WIFI` 返回 `connected` / `saved_ssid` 与实机一致（不含密码）
 - [ ] 手机 Bond 后 `SET_WIFI` 可连路由器
 - [ ] Wi‑Fi 连接后 BLE 停止（日志 `Oye BLE service stopped`）
 - [ ] 联网后 `REFRESH_OTA` / `GET_OTA_INFO` 与串口 `Ota` 一致

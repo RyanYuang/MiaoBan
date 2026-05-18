@@ -80,6 +80,35 @@ void HandleGetOtaInfo(oye_device_v1_Envelope& response) {
     }
 }
 
+void HandleGetWifi(oye_device_v1_Envelope& response) {
+    auto& wifi = WifiManager::GetInstance();
+    const auto& saved = SsidManager::GetInstance().GetSsidList();
+
+    oye_device_v1_WifiInfo info = oye_device_v1_WifiInfo_init_zero;
+    info.connected = wifi.IsInitialized() && wifi.IsConnected();
+    info.in_config_mode = wifi.IsInitialized() && wifi.IsConfigMode();
+    info.has_saved_credentials = !saved.empty();
+    info.saved_network_count = static_cast<uint32_t>(saved.size());
+
+    if (!saved.empty()) {
+        strncpy(info.saved_ssid, saved.front().ssid.c_str(), sizeof(info.saved_ssid) - 1);
+    }
+    if (info.connected) {
+        strncpy(info.current_ssid, wifi.GetSsid().c_str(), sizeof(info.current_ssid) - 1);
+        strncpy(info.ip_address, wifi.GetIpAddress().c_str(), sizeof(info.ip_address) - 1);
+        info.rssi = wifi.GetRssi();
+        info.channel = wifi.GetChannel();
+    }
+
+    pb_ostream_t stream =
+        pb_ostream_from_buffer(response.payload.bytes, sizeof(response.payload.bytes));
+    if (!pb_encode(&stream, oye_device_v1_WifiInfo_fields, &info)) {
+        SetError(response, oye_device_v1_ErrorCode_ERR_INTERNAL, "encode WifiInfo");
+    } else {
+        response.payload.size = stream.bytes_written;
+    }
+}
+
 void HandleGetUserInfo(oye_device_v1_Envelope& response) {
     auto data = OtaSnapshot::GetInstance().GetData();
     Settings user("user", false);
@@ -189,6 +218,9 @@ void HandleEnvelope(const oye_device_v1_Envelope& request, oye_device_v1_Envelop
             break;
         case oye_device_v1_Command_CMD_GET_USER_INFO:
             HandleGetUserInfo(response);
+            break;
+        case oye_device_v1_Command_CMD_GET_WIFI:
+            HandleGetWifi(response);
             break;
         case oye_device_v1_Command_CMD_SET_WIFI:
             HandleSetWifi(request, response);

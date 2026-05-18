@@ -7,6 +7,7 @@ enum Command {
   CMD_GET_DEVICE_INFO = 1;
   CMD_GET_OTA_INFO = 2;
   CMD_GET_USER_INFO = 3;
+  CMD_GET_WIFI = 4;
   CMD_SET_WIFI = 10;
   CMD_SET_USER_TOKEN = 11;
   CMD_REFRESH_OTA = 12;
@@ -60,6 +61,19 @@ message UserInfo {
   string activation_code = 2;
   string activation_message = 3;
   bool has_token = 4;
+}
+
+/** 设备 → App：当前 Wi-Fi 状态（不含密码）。 */
+message WifiInfo {
+  bool connected = 1;
+  bool in_config_mode = 2;
+  bool has_saved_credentials = 3;
+  string current_ssid = 4;
+  string saved_ssid = 5;
+  string ip_address = 6;
+  int32 rssi = 7;
+  int32 channel = 8;
+  uint32 saved_network_count = 9;
 }
 
 message SetWifiRequest {

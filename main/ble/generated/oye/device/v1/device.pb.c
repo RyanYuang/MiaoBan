@@ -21,6 +21,9 @@ PB_BIND(oye_device_v1_OtaInfo, oye_device_v1_OtaInfo, 2)
 PB_BIND(oye_device_v1_UserInfo, oye_device_v1_UserInfo, 2)
 
 
+PB_BIND(oye_device_v1_WifiInfo, oye_device_v1_WifiInfo, AUTO)
+
+
 PB_BIND(oye_device_v1_SetWifiRequest, oye_device_v1_SetWifiRequest, AUTO)
 
 

@@ -11,6 +11,9 @@ oye.device.v1.OtaInfo.new_version max_size:32
 oye.device.v1.OtaInfo.firmware_url max_size:256
 oye.device.v1.UserInfo.activation_code max_size:32
 oye.device.v1.UserInfo.activation_message max_size:256
+oye.device.v1.WifiInfo.current_ssid max_size:33
+oye.device.v1.WifiInfo.saved_ssid max_size:33
+oye.device.v1.WifiInfo.ip_address max_size:16
 oye.device.v1.SetWifiRequest.ssid max_size:33
 oye.device.v1.SetWifiRequest.password max_size:64
 oye.device.v1.SetUserTokenRequest.access_token max_size:256

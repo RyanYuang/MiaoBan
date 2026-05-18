@@ -15,6 +15,7 @@ typedef enum _oye_device_v1_Command {
     oye_device_v1_Command_CMD_GET_DEVICE_INFO = 1,
     oye_device_v1_Command_CMD_GET_OTA_INFO = 2,
     oye_device_v1_Command_CMD_GET_USER_INFO = 3,
+    oye_device_v1_Command_CMD_GET_WIFI = 4,
     oye_device_v1_Command_CMD_SET_WIFI = 10,
     oye_device_v1_Command_CMD_SET_USER_TOKEN = 11,
     oye_device_v1_Command_CMD_REFRESH_OTA = 12,
@@ -73,6 +74,19 @@ typedef struct _oye_device_v1_UserInfo {
     bool has_token;
 } oye_device_v1_UserInfo;
 
+/* * 设备 → App：当前 Wi-Fi 状态（不含密码）。 */
+typedef struct _oye_device_v1_WifiInfo {
+    bool connected;
+    bool in_config_mode;
+    bool has_saved_credentials;
+    char current_ssid[33];
+    char saved_ssid[33];
+    char ip_address[16];
+    int32_t rssi;
+    int32_t channel;
+    uint32_t saved_network_count;
+} oye_device_v1_WifiInfo;
+
 typedef struct _oye_device_v1_SetWifiRequest {
     char ssid[33];
     char password[64];
@@ -111,12 +125,14 @@ extern "C" {
 
 
 
+
 /* Initializer values for message structs */
 #define oye_device_v1_Envelope_init_default      {0, 0, _oye_device_v1_Command_MIN, {0, {0}}, _oye_device_v1_ErrorCode_MIN, ""}
 #define oye_device_v1_Chunk_init_default         {0, 0, {0, {0}}}
 #define oye_device_v1_DeviceInfo_init_default    {"", "", "", "", ""}
 #define oye_device_v1_OtaInfo_init_default       {"", 0, "", "", 0, 0}
 #define oye_device_v1_UserInfo_init_default      {0, "", "", 0}
+#define oye_device_v1_WifiInfo_init_default      {0, 0, 0, "", "", "", 0, 0, 0}
 #define oye_device_v1_SetWifiRequest_init_default {"", ""}
 #define oye_device_v1_SetUserTokenRequest_init_default {""}
 #define oye_device_v1_Empty_init_default         {0}
@@ -125,6 +141,7 @@ extern "C" {
 #define oye_device_v1_DeviceInfo_init_zero       {"", "", "", "", ""}
 #define oye_device_v1_OtaInfo_init_zero          {"", 0, "", "", 0, 0}
 #define oye_device_v1_UserInfo_init_zero         {0, "", "", 0}
+#define oye_device_v1_WifiInfo_init_zero         {0, 0, 0, "", "", "", 0, 0, 0}
 #define oye_device_v1_SetWifiRequest_init_zero   {"", ""}
 #define oye_device_v1_SetUserTokenRequest_init_zero {""}
 #define oye_device_v1_Empty_init_zero            {0}
@@ -154,6 +171,15 @@ extern "C" {
 #define oye_device_v1_UserInfo_activation_code_tag 2
 #define oye_device_v1_UserInfo_activation_message_tag 3
 #define oye_device_v1_UserInfo_has_token_tag     4
+#define oye_device_v1_WifiInfo_connected_tag     1
+#define oye_device_v1_WifiInfo_in_config_mode_tag 2
+#define oye_device_v1_WifiInfo_has_saved_credentials_tag 3
+#define oye_device_v1_WifiInfo_current_ssid_tag  4
+#define oye_device_v1_WifiInfo_saved_ssid_tag    5
+#define oye_device_v1_WifiInfo_ip_address_tag    6
+#define oye_device_v1_WifiInfo_rssi_tag          7
+#define oye_device_v1_WifiInfo_channel_tag       8
+#define oye_device_v1_WifiInfo_saved_network_count_tag 9
 #define oye_device_v1_SetWifiRequest_ssid_tag    1
 #define oye_device_v1_SetWifiRequest_password_tag 2
 #define oye_device_v1_SetUserTokenRequest_access_token_tag 1
@@ -203,6 +229,19 @@ X(a, STATIC,   SINGULAR, BOOL,     has_token,         4)
 #define oye_device_v1_UserInfo_CALLBACK NULL
 #define oye_device_v1_UserInfo_DEFAULT NULL
 
+#define oye_device_v1_WifiInfo_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     connected,         1) \
+X(a, STATIC,   SINGULAR, BOOL,     in_config_mode,    2) \
+X(a, STATIC,   SINGULAR, BOOL,     has_saved_credentials,   3) \
+X(a, STATIC,   SINGULAR, STRING,   current_ssid,      4) \
+X(a, STATIC,   SINGULAR, STRING,   saved_ssid,        5) \
+X(a, STATIC,   SINGULAR, STRING,   ip_address,        6) \
+X(a, STATIC,   SINGULAR, INT32,    rssi,              7) \
+X(a, STATIC,   SINGULAR, INT32,    channel,           8) \
+X(a, STATIC,   SINGULAR, UINT32,   saved_network_count,   9)
+#define oye_device_v1_WifiInfo_CALLBACK NULL
+#define oye_device_v1_WifiInfo_DEFAULT NULL
+
 #define oye_device_v1_SetWifiRequest_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   ssid,              1) \
 X(a, STATIC,   SINGULAR, STRING,   password,          2)
@@ -224,6 +263,7 @@ extern const pb_msgdesc_t oye_device_v1_Chunk_msg;
 extern const pb_msgdesc_t oye_device_v1_DeviceInfo_msg;
 extern const pb_msgdesc_t oye_device_v1_OtaInfo_msg;
 extern const pb_msgdesc_t oye_device_v1_UserInfo_msg;
+extern const pb_msgdesc_t oye_device_v1_WifiInfo_msg;
 extern const pb_msgdesc_t oye_device_v1_SetWifiRequest_msg;
 extern const pb_msgdesc_t oye_device_v1_SetUserTokenRequest_msg;
 extern const pb_msgdesc_t oye_device_v1_Empty_msg;
@@ -234,6 +274,7 @@ extern const pb_msgdesc_t oye_device_v1_Empty_msg;
 #define oye_device_v1_DeviceInfo_fields &oye_device_v1_DeviceInfo_msg
 #define oye_device_v1_OtaInfo_fields &oye_device_v1_OtaInfo_msg
 #define oye_device_v1_UserInfo_fields &oye_device_v1_UserInfo_msg
+#define oye_device_v1_WifiInfo_fields &oye_device_v1_WifiInfo_msg
 #define oye_device_v1_SetWifiRequest_fields &oye_device_v1_SetWifiRequest_msg
 #define oye_device_v1_SetUserTokenRequest_fields &oye_device_v1_SetUserTokenRequest_msg
 #define oye_device_v1_Empty_fields &oye_device_v1_Empty_msg
@@ -248,6 +289,7 @@ extern const pb_msgdesc_t oye_device_v1_Empty_msg;
 #define oye_device_v1_SetUserTokenRequest_size   258
 #define oye_device_v1_SetWifiRequest_size        99
 #define oye_device_v1_UserInfo_size              295
+#define oye_device_v1_WifiInfo_size              119
 
 #ifdef __cplusplus
 } /* extern "C" */

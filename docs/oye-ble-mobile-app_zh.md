@@ -188,6 +188,7 @@ message Envelope {
 | 1 | `CMD_GET_DEVICE_INFO` | 否 | 读设备信息 |
 | 2 | `CMD_GET_OTA_INFO` | 否 | 读 OTA 缓存快照 |
 | 3 | `CMD_GET_USER_INFO` | 否 | 读激活 / Token 状态 |
+| 4 | `CMD_GET_WIFI` | 否 | 读当前 Wi‑Fi 状态（`WifiInfo`） |
 | 10 | `CMD_SET_WIFI` | **是** | 下发 Wi‑Fi |
 | 11 | `CMD_SET_USER_TOKEN` | **是** | 保存 access_token |
 | 12 | `CMD_REFRESH_OTA` | 否 | 设备联网时 HTTP 拉 OTA，再返回 OtaInfo |
@@ -243,7 +244,30 @@ message Envelope {
 | `activation_message` | string | 激活提示文案 |
 | `has_token` | bool | NVS 是否已有 `access_token` |
 
-### 7.4 `CMD_SET_WIFI` ← `SetWifiRequest`
+### 7.4 `CMD_GET_WIFI` → `WifiInfo`
+
+设备上报当前 Wi‑Fi 状态，**永不返回密码**。请求 `payload` 为空。
+
+| 字段 | 类型 | 最大长度 | 说明 |
+|------|------|----------|------|
+| `connected` | bool | — | Station 是否已连上路由器 |
+| `in_config_mode` | bool | — | 是否处于配网/配置模式 |
+| `has_saved_credentials` | bool | — | NVS 是否至少保存过一组 SSID（含密码，但本消息不下发密码） |
+| `current_ssid` | string | 33 | 当前连接的 SSID；未连接时为空 |
+| `saved_ssid` | string | 33 | 已保存列表中的**第一条** SSID（设备下次优先尝试的网络名） |
+| `ip_address` | string | 16 | 已连接时的 IPv4，如 `192.168.1.10` |
+| `rssi` | int32 | — | 已连接时的信号强度（dBm）；未连接时为 0 |
+| `channel` | int32 | — | 已连接时的信道；未连接时为 0 |
+| `saved_network_count` | uint32 | — | NVS 中已保存的 Wi‑Fi 条目数量 |
+
+**App 使用建议**
+
+- 配网页进入时调用，用于展示「已连接 / 已保存但未连 / 无配置」。
+- `connected == true` 时以 `current_ssid`、`ip_address`、`rssi` 更新 UI。
+- `connected == false && has_saved_credentials` 时展示 `saved_ssid` 并提示「正在连接或连接失败」。
+- 修改网络仍须 Bond 后调用 `CMD_SET_WIFI`。
+
+### 7.5 `CMD_SET_WIFI` ← `SetWifiRequest`
 
 | 字段 | 类型 | 最大长度 |
 |------|------|----------|
@@ -252,7 +276,7 @@ message Envelope {
 
 成功后设备会：保存 SSID、启动 Station 连接路由器。**数秒内 BLE 可能断开**（连网后固件 `Stop()` BLE）。
 
-### 7.5 `CMD_SET_USER_TOKEN` ← `SetUserTokenRequest`
+### 7.6 `CMD_SET_USER_TOKEN` ← `SetUserTokenRequest`
 
 | 字段 | 类型 | 最大长度 |
 |------|------|----------|
@@ -260,7 +284,7 @@ message Envelope {
 
 设备写入 NVS；后续 HTTP OTA 请求会自动加 `Authorization` 头（无空格时自动加 `Bearer ` 前缀）。
 
-### 7.6 `CMD_REFRESH_OTA`
+### 7.7 `CMD_REFRESH_OTA`
 
 - 请求 `payload` 为空。
 - 若 Wi‑Fi **未连接**：`ERR_NO_NETWORK`。
@@ -282,6 +306,8 @@ sequenceDiagram
     App->>Device: 系统 Bond / 加密链路建立
     App->>Device: GET_DEVICE_INFO
     Device-->>App: DeviceInfo
+    App->>Device: GET_WIFI
+    Device-->>App: WifiInfo
     App->>Device: SET_WIFI (Bond 后)
     Device-->>App: ERR_OK
     Note over Device: 连接路由器，BLE 关闭
@@ -300,10 +326,11 @@ sequenceDiagram
 2. 连接并订阅 `rsp`。
 3. 完成系统配对（Bond）。
 4. 发 `GET_DEVICE_INFO`，展示设备型号与版本。
-5. 用户选择 Wi‑Fi，发 `SET_WIFI`（ssid/password）。
-6. 等待设备上网（BLE 可能已断，属正常）。
-7. 若需展示新版本：在设备仍广播时发 `REFRESH_OTA`，或提示用户稍后到「已绑定设备」页再查。
-8. 用户登录 App 后，发 `SET_USER_TOKEN` 绑定账号。
+5. 发 `GET_WIFI`，展示当前连接或已保存网络（无密码）。
+6. 用户选择 Wi‑Fi，发 `SET_WIFI`（ssid/password）。
+7. 等待设备上网（BLE 可能已断，属正常）。
+8. 若需展示新版本：在设备仍广播时发 `REFRESH_OTA`，或提示用户稍后到「已绑定设备」页再查。
+9. 用户登录 App 后，发 `SET_USER_TOKEN` 绑定账号。
 
 ### 8.3 `request_id` 建议
 
