@@ -19,6 +19,10 @@
 #include <lvgl.h>
 #endif
 
+#if CONFIG_USE_OYE_CLOUD_API
+#include "meeting/meeting_emote_ui.h"
+#endif
+
 namespace {
 
 constexpr char TAG[] = "UiPageRouter";
@@ -77,6 +81,7 @@ UiPageRouter& UiPageRouter::Instance() {
 void UiPageRouter::Init(Display* display) {
     display_ = display;
     page_stack_depth_ = 0;
+    restore_on_back_ = UiPageId::kNone;
     for (std::size_t i = 0; i < kMaxPageDepth; ++i) {
         page_stack_[i] = nullptr;
     }
@@ -85,6 +90,12 @@ void UiPageRouter::Init(Display* display) {
 /** 将「前进到指定页」投递到 UI 命令队列，在 UI 线程串行执行 ApplyNavigateTo。 */
 void UiPageRouter::PostNavigateTo(UiPageId id) {
     UiCommandDispatcher::Instance().Post([this, id]() { ApplyNavigateTo(id); });
+}
+
+void UiPageRouter::PostNavigateToReplacingTop(UiPageId to, UiPageId restore_on_back) {
+    UiCommandDispatcher::Instance().Post([this, to, restore_on_back]() {
+        ApplyNavigateToReplacingTop(to, restore_on_back);
+    });
 }
 
 /** 将「返回上一页」投递到 UI 命令队列，在 UI 线程串行执行 ApplyNavigateBack。 */
@@ -104,6 +115,7 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
     if (display_ == nullptr || id == UiPageId::kNone) {
         return;
     }
+    restore_on_back_ = UiPageId::kNone;
 
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
     auto* lvgl = dynamic_cast<LvglDisplay*>(display_);
@@ -143,31 +155,99 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
         case UiPageId::kWifi:
             display_->ShowNotification("Wi-Fi", 60000);
             break;
+#if CONFIG_USE_OYE_CLOUD_API
+        case UiPageId::kMeeting:
+            ui::meeting::MeetingEmoteUi::Instance().Enter(display_);
+            break;
+#endif
         default:
             break;
     }
 #endif
 }
 
+void UiPageRouter::ApplyNavigateToReplacingTop(UiPageId to, UiPageId restore_on_back) {
+    if (display_ == nullptr || to == UiPageId::kNone) {
+        return;
+    }
+
+#ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
+    auto* lvgl = dynamic_cast<LvglDisplay*>(display_);
+    if (lvgl == nullptr || !display_->IsSetupUICalled()) {
+        ESP_LOGW(TAG, "NavigateToReplacingTop: not LvglDisplay or SetupUI not called");
+        return;
+    }
+    DisplayLockGuard lock(display_);
+    if (!PageStackEmpty()) {
+        ESP_LOGI(TAG, "NavigateToReplacingTop: destroy stack top before page %u", static_cast<unsigned>(to));
+        DestroyPageStackTop();
+    }
+    restore_on_back_ = restore_on_back;
+    lv_obj_t* root = CreateLvglPageRoot(to, display_);
+    if (root == nullptr) {
+        restore_on_back_ = UiPageId::kNone;
+        return;
+    }
+    PageStackPush(root);
+    lv_obj_move_foreground(root);
+#else
+    (void)restore_on_back;
+    ApplyNavigateTo(to);
+#endif
+}
+
 /**
  * 在 UI 线程执行返回：LVGL 模式下弹出栈顶并 lv_obj_del；表情模式下无栈，仅打日志。
  */
+void UiPageRouter::NavigateBackFromInput() {
+#ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
+    if (display_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(display_);
+    ApplyNavigateBackLocked();
+#else
+    PostNavigateBack();
+#endif
+}
+
+void UiPageRouter::ApplyNavigateBackLocked() {
+#ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
+    if (display_ == nullptr) {
+        return;
+    }
+    if (PageStackEmpty()) {
+        ESP_LOGD(TAG, "NavigateBack: stack empty");
+        return;
+    }
+    DestroyPageStackTop();
+    if (restore_on_back_ != UiPageId::kNone) {
+        const UiPageId restore = restore_on_back_;
+        restore_on_back_ = UiPageId::kNone;
+        ESP_LOGI(TAG, "NavigateBack: recreate page %u", static_cast<unsigned>(restore));
+        lv_obj_t* root = CreateLvglPageRoot(restore, display_);
+        if (root != nullptr) {
+            PageStackPush(root);
+            lv_obj_move_foreground(root);
+        }
+    }
+#endif
+}
+
 void UiPageRouter::ApplyNavigateBack() {
     if (display_ == nullptr) {
         return;
     }
 
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
-    if (PageStackEmpty()) {
-        ESP_LOGD(TAG, "NavigateBack: stack empty");
-        return;
-    }
     DisplayLockGuard lock(display_);
-    void* top = PageStackPop();
-    if (top != nullptr) {
-        lv_obj_del(static_cast<lv_obj_t*>(top));
-    }
+    ApplyNavigateBackLocked();
 #else
+#if CONFIG_USE_OYE_CLOUD_API
+    if (ui::meeting::MeetingEmoteUi::Instance().IsActive()) {
+        ui::meeting::MeetingEmoteUi::Instance().Exit();
+    }
+#endif
     ESP_LOGD(TAG, "NavigateBack: emote style has no LVGL page stack");
 #endif
 }
@@ -185,15 +265,22 @@ void UiPageRouter::ApplyNavigateCloseAll()
         return;
     }
     DisplayLockGuard lock(display_);
+    restore_on_back_ = UiPageId::kNone;
     while (!PageStackEmpty()) {
-        void* top = PageStackPop();
-        if (top != nullptr) {
-            lv_obj_del(static_cast<lv_obj_t*>(top));
-        }
+        DestroyPageStackTop();
     }
 #else
     ESP_LOGD(TAG, "NavigateCloseAll: emote style has no LVGL page stack");
 #endif
+}
+
+bool UiPageRouter::DestroyPageStackTop() {
+    void* top = PageStackPop();
+    if (top == nullptr) {
+        return false;
+    }
+    lv_obj_del(static_cast<lv_obj_t*>(top));
+    return true;
 }
 
 /** 将一页的根指针压入内部栈；栈满则丢弃本次入栈并打警告日志。 */

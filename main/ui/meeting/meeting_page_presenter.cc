@@ -1,0 +1,514 @@
+#include "meeting_page_presenter.h"
+
+#include "display.h"
+#include "meeting_page_view.h"
+#include "ui_command_dispatcher.h"
+#include "ui_page_ids.h"
+#include "ui_page_router.h"
+
+#include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <sdkconfig.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <lvgl.h>
+
+#include <functional>
+#include <new>
+
+#if CONFIG_USE_OYE_CLOUD_API
+#include "oye/oye_audio_util.h"
+#include "oye/oye_cloud_api.h"
+#include "oye/oye_config.h"
+#endif
+
+namespace ui::meeting {
+
+namespace {
+
+constexpr char TAG[] = "MeetingPresenter";
+constexpr uintptr_t kUserDataBack = 0x4241434Bu;
+constexpr uintptr_t kUserDataRefresh = 0x52454652u;
+constexpr uintptr_t kUserDataRecord = 0x52454344u;
+constexpr uintptr_t kUserDataRowBase = 0x4D545230u;
+constexpr int kRecordMs = 8000;
+constexpr int kListPageSize = 1;
+constexpr uint32_t kMeetingUiTaskStackWords = 2560;
+
+/** xTaskCreateStatic 用的栈/TCB 只分配一次并复用；此前每次请求都 malloc 且永不 free，导致 internal 碎片化。 */
+struct MeetingUiWorkerPool {
+    StackType_t* stack = nullptr;
+    StaticTask_t* tcb = nullptr;
+    bool busy = false;
+
+    void LogHeap(const char* label) const {
+        ESP_LOGI(TAG, "%s: free_internal=%u largest_internal=%u pool_busy=%d",
+                 label, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)), busy ? 1 : 0);
+    }
+
+    bool EnsureAllocated() {
+        if (stack != nullptr && tcb != nullptr) {
+            return true;
+        }
+        stack = static_cast<StackType_t*>(
+            heap_caps_malloc(kMeetingUiTaskStackWords * sizeof(StackType_t), MALLOC_CAP_SPIRAM));
+        tcb = static_cast<StaticTask_t*>(heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
+        if (stack == nullptr || tcb == nullptr) {
+            ReleaseIfIdle();
+            return false;
+        }
+        LogHeap("meeting worker pool allocated");
+        return true;
+    }
+
+    void ReleaseIfIdle() {
+        if (busy) {
+            return;
+        }
+        if (stack != nullptr) {
+            heap_caps_free(stack);
+            stack = nullptr;
+        }
+        if (tcb != nullptr) {
+            heap_caps_free(tcb);
+            tcb = nullptr;
+        }
+    }
+};
+
+MeetingUiWorkerPool& MeetingUiWorkerPoolInstance() {
+    static MeetingUiWorkerPool pool;
+    return pool;
+}
+
+void PostUiIfAlive(const std::shared_ptr<std::atomic<bool>>& alive, std::function<void()> fn) {
+    if (alive == nullptr || !alive->load()) {
+        return;
+    }
+    UiCommandDispatcher::Instance().Post([alive, fn = std::move(fn)]() mutable {
+        if (!alive->load()) {
+            return;
+        }
+        fn();
+    });
+}
+
+static std::string StatusText(const std::string& status) {
+    if (status == "pending") {
+        return "等待";
+    }
+    if (status == "submitting") {
+        return "提交中";
+    }
+    if (status == "transcribing") {
+        return "转写中";
+    }
+    if (status == "summarizing") {
+        return "生成纪要";
+    }
+    if (status == "done") {
+        return "完成";
+    }
+    if (status == "failed") {
+        return "失败";
+    }
+    return status;
+}
+
+}  // namespace
+
+void ReleaseMeetingUiWorkerIfIdle() {
+    auto& pool = MeetingUiWorkerPoolInstance();
+    pool.ReleaseIfIdle();
+    pool.LogHeap("meeting worker pool release");
+}
+
+MeetingPagePresenter::MeetingPagePresenter(IMeetingPageView* view, Display* display)
+    : view_(view), display_(display) {}
+
+void MeetingPagePresenter::BindPageLifetime(std::shared_ptr<std::atomic<bool>> alive) {
+    page_alive_ = std::move(alive);
+}
+
+bool MeetingPagePresenter::IsPageAlive() const {
+    return page_alive_ != nullptr && page_alive_->load();
+}
+
+void MeetingPagePresenter::PostUi(std::function<void()> fn) {
+    if (!IsPageAlive()) {
+        return;
+    }
+    std::shared_ptr<std::atomic<bool>> alive = page_alive_;
+    UiCommandDispatcher::Instance().Post([alive, fn = std::move(fn)]() mutable {
+        if (!alive->load()) {
+            return;
+        }
+        fn();
+    });
+}
+
+void MeetingPagePresenter::Show(const MeetingPageModel& model) {
+    model_ = model;
+    if (view_ == nullptr) {
+        return;
+    }
+    if (display_ != nullptr) {
+        DisplayLockGuard lock(display_);
+        view_->Show(model_);
+        return;
+    }
+    view_->Show(model_);
+}
+
+void MeetingPagePresenter::OnShow() {
+#if CONFIG_USE_OYE_CLOUD_API
+    if (!oye::HasAccessToken()) {
+        ESP_LOGW(TAG, "OnShow: no access token, skip refresh");
+        model_.status_line = "请先在 App 中绑定账号";
+        model_.loading = false;
+        Show(model_);
+        return;
+    }
+    ESP_LOGI(TAG, "OnShow: has token, refresh list");
+    RefreshList();
+#else
+    model_.status_line = "未启用 Oye 云服务";
+    Show(model_);
+#endif
+}
+
+void MeetingPagePresenter::OnClick(lv_event_t* e) {
+    lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    const uintptr_t ud = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target));
+
+    if (ud == kUserDataBack) {
+        NavigateBack();
+        return;
+    }
+    if (ud == kUserDataRefresh) {
+        ESP_LOGI(TAG, "refresh button clicked");
+        RefreshList();
+        return;
+    }
+    if (ud == kUserDataRecord) {
+        StartRecordAndUpload();
+        return;
+    }
+    if (ud >= kUserDataRowBase && ud < kUserDataRowBase + 100) {
+        const int meeting_id = static_cast<int>(ud - kUserDataRowBase);
+        OpenDetail(meeting_id);
+    }
+}
+
+void MeetingPagePresenter::NavigateBack() {
+    UiPageRouter::Instance().NavigateBackFromInput();
+}
+
+void MeetingPagePresenter::RefreshList() {
+#if !CONFIG_USE_OYE_CLOUD_API
+    return;
+#endif
+    if (busy_) {
+        ESP_LOGW(TAG, "RefreshList ignored: busy");
+        return;
+    }
+    ESP_LOGI(TAG, "RefreshList start");
+    busy_ = true;
+    model_.loading = true;
+    model_.show_detail = false;
+    model_.status_line = "加载会议列表…";
+    Show(model_);
+    RunNetworkTask(RefreshListTask);
+}
+
+void MeetingPagePresenter::OpenDetail(int meeting_id) {
+#if !CONFIG_USE_OYE_CLOUD_API
+    return;
+#endif
+    if (busy_ || meeting_id <= 0) {
+        ESP_LOGW(TAG, "OpenDetail ignored: busy=%d id=%d", busy_ ? 1 : 0, meeting_id);
+        return;
+    }
+    ESP_LOGI(TAG, "OpenDetail id=%d", meeting_id);
+    pending_detail_id_ = meeting_id;
+    busy_ = true;
+    model_.loading = true;
+    model_.status_line = "加载详情…";
+    Show(model_);
+    RunNetworkTask(LoadDetailTask);
+}
+
+void MeetingPagePresenter::StartRecordAndUpload() {
+#if !CONFIG_USE_OYE_CLOUD_API
+    return;
+#endif
+    if (busy_) {
+        ESP_LOGW(TAG, "StartRecordAndUpload ignored: busy");
+        return;
+    }
+    if (!oye::HasAccessToken()) {
+        model_.status_line = "请先绑定账号";
+        Show(model_);
+        return;
+    }
+    ESP_LOGI(TAG, "StartRecordAndUpload: record %d ms", kRecordMs);
+    busy_ = true;
+    model_.loading = true;
+    model_.status_line = "录音中…";
+    Show(model_);
+    RunNetworkTask(UploadTask);
+}
+
+void MeetingPagePresenter::NotifyTaskFailed(const char* status_line) {
+    const std::string status = status_line;
+    PostUi([this, status]() {
+        busy_ = false;
+        model_.loading = false;
+        model_.status_line = status;
+        Show(model_);
+    });
+}
+
+void MeetingPagePresenter::RunNetworkTask(void (*worker)(MeetingPagePresenter* self)) {
+    auto& pool = MeetingUiWorkerPoolInstance();
+    if (pool.busy) {
+        ESP_LOGW(TAG, "RunNetworkTask: worker busy");
+        NotifyTaskFailed("请稍候…");
+        return;
+    }
+
+    struct TaskCtx {
+        MeetingPagePresenter* self;
+        void (*worker)(MeetingPagePresenter*);
+    };
+    auto* ctx = new (std::nothrow) TaskCtx{this, worker};
+    if (ctx == nullptr) {
+        ESP_LOGE(TAG, "RunNetworkTask: alloc ctx failed");
+        NotifyTaskFailed("内存不足，操作失败");
+        return;
+    }
+
+    auto task_entry = [](void* p) {
+        auto* task_ctx = static_cast<TaskCtx*>(p);
+        ESP_LOGI(TAG, "oye_meeting_ui task running");
+        if (task_ctx != nullptr) {
+            if (task_ctx->worker != nullptr && task_ctx->self != nullptr) {
+                task_ctx->worker(task_ctx->self);
+            }
+            delete task_ctx;
+        }
+        MeetingUiWorkerPoolInstance().busy = false;
+        vTaskDelete(nullptr);
+    };
+
+    pool.busy = true;
+    TaskHandle_t handle = nullptr;
+#if CONFIG_SPIRAM
+    if (pool.EnsureAllocated()) {
+        handle = xTaskCreateStatic(task_entry, "oye_meeting_ui", kMeetingUiTaskStackWords, ctx, 5, pool.stack,
+                                   pool.tcb);
+        if (handle != nullptr) {
+            ESP_LOGI(TAG, "oye_meeting_ui started (reused PSRAM stack)");
+        } else {
+            ESP_LOGE(TAG, "oye_meeting_ui xTaskCreateStatic failed");
+        }
+    }
+#endif
+    if (handle == nullptr) {
+        if (xTaskCreate(task_entry, "oye_meeting_ui", kMeetingUiTaskStackWords, ctx, 5, &handle) != pdPASS) {
+            pool.busy = false;
+            pool.LogHeap("oye_meeting_ui task create failed");
+            delete ctx;
+            NotifyTaskFailed("内存不足，操作失败");
+            return;
+        }
+        ESP_LOGI(TAG, "oye_meeting_ui started (internal stack fallback)");
+    }
+}
+
+void MeetingPagePresenter::RefreshListTask(MeetingPagePresenter* self) {
+#if CONFIG_USE_OYE_CLOUD_API
+    const auto alive = self->page_alive_;
+    ESP_LOGI(TAG, "RefreshListTask: begin (self=%p)", static_cast<void*>(self));
+    std::vector<oye::MeetingInfo> items;
+    esp_err_t err = oye::ListMeetings(1, kListPageSize, items);
+    ESP_LOGI(TAG, "RefreshListTask: ListMeetings finished err=%s count=%u",
+             esp_err_to_name(err), static_cast<unsigned>(items.size()));
+
+    if (alive == nullptr || !alive->load()) {
+        ESP_LOGW(TAG, "RefreshListTask: page destroyed before UI update");
+        return;
+    }
+    ESP_LOGI(TAG, "RefreshListTask: posting UI update to ui_cmd");
+    PostUiIfAlive(alive, [self, err, items = std::move(items)]() mutable {
+        ESP_LOGI(TAG, "RefreshListTask UI callback: err=%s items=%u",
+                 esp_err_to_name(err), static_cast<unsigned>(items.size()));
+        self->busy_ = false;
+        self->model_.loading = false;
+        self->model_.meetings.clear();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "RefreshListTask UI: show load failed");
+            self->model_.status_line = "加载失败（网络超时或内存不足）";
+            self->Show(self->model_);
+            return;
+        }
+        for (const auto& m : items) {
+            MeetingRowModel row;
+            row.id = m.id;
+            row.title = m.title.empty() ? ("会议 #" + std::to_string(m.id)) : m.title;
+            row.status = StatusText(m.status);
+            row.summary_preview = m.summary;
+            if (row.summary_preview.size() > 48) {
+                row.summary_preview.resize(48);
+                row.summary_preview += "…";
+            }
+            self->model_.meetings.push_back(std::move(row));
+        }
+        self->model_.status_line = self->model_.meetings.empty() ? "暂无会议，可录音上传" : "共 " +
+                                                                 std::to_string(self->model_.meetings.size()) +
+                                                                 " 条";
+        ESP_LOGI(TAG, "RefreshListTask UI: %u row(s)", static_cast<unsigned>(self->model_.meetings.size()));
+        self->Show(self->model_);
+    });
+#else
+    (void)self;
+#endif
+}
+
+void MeetingPagePresenter::LoadDetailTask(MeetingPagePresenter* self) {
+#if CONFIG_USE_OYE_CLOUD_API
+    const auto alive = self->page_alive_;
+    const int id = self->pending_detail_id_;
+    ESP_LOGI(TAG, "LoadDetailTask: begin id=%d", id);
+    oye::MeetingInfo info;
+    esp_err_t err = oye::GetMeeting(id, info);
+    ESP_LOGI(TAG, "LoadDetailTask: GetMeeting finished err=%s status=%s", esp_err_to_name(err),
+             info.status.c_str());
+
+    if (alive == nullptr || !alive->load()) {
+        ESP_LOGW(TAG, "LoadDetailTask: page destroyed before UI update");
+        return;
+    }
+    ESP_LOGI(TAG, "LoadDetailTask: posting UI update to ui_cmd");
+    PostUiIfAlive(alive, [self, err, info = std::move(info)]() mutable {
+        ESP_LOGI(TAG, "LoadDetailTask UI callback: err=%s", esp_err_to_name(err));
+        self->busy_ = false;
+        self->model_.loading = false;
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "LoadDetailTask UI: show failed id=%d", self->pending_detail_id_);
+            self->model_.status_line = "详情加载失败";
+            self->Show(self->model_);
+            return;
+        }
+        self->model_.show_detail = true;
+        self->model_.selected_id = info.id;
+        self->model_.detail_title = info.title.empty() ? ("会议 #" + std::to_string(info.id)) : info.title;
+        self->model_.detail_status = StatusText(info.status);
+        self->model_.detail_body.clear();
+        if (!info.summary.empty()) {
+            self->model_.detail_body += "摘要:\n";
+            self->model_.detail_body += info.summary;
+            self->model_.detail_body += "\n\n";
+        }
+        if (!info.transcript_text.empty()) {
+            self->model_.detail_body += "转写:\n";
+            self->model_.detail_body += info.transcript_text;
+            self->model_.detail_body += "\n\n";
+        }
+        if (!info.error_message.empty()) {
+            self->model_.detail_body += "错误: ";
+            self->model_.detail_body += info.error_message;
+        }
+        if (self->model_.detail_body.empty()) {
+            self->model_.detail_body = "暂无纪要内容";
+        }
+        self->model_.status_line = "会议 #" + std::to_string(info.id);
+        self->Show(self->model_);
+    });
+#else
+    (void)self;
+#endif
+}
+
+void MeetingPagePresenter::UploadTask(MeetingPagePresenter* self) {
+#if CONFIG_USE_OYE_CLOUD_API
+    const auto alive = self->page_alive_;
+    ESP_LOGI(TAG, "UploadTask: record begin");
+    std::vector<int16_t> pcm;
+    if (!oye::RecordPcmMs(kRecordMs, pcm)) {
+        ESP_LOGE(TAG, "UploadTask: RecordPcmMs failed");
+        PostUiIfAlive(alive, [self]() {
+            self->busy_ = false;
+            self->model_.loading = false;
+            self->model_.status_line = "录音失败";
+            self->Show(self->model_);
+        });
+        return;
+    }
+    ESP_LOGI(TAG, "UploadTask: recorded %u samples", static_cast<unsigned>(pcm.size()));
+
+    std::vector<uint8_t> wav;
+    if (!oye::BuildWavFromPcm(pcm, wav)) {
+        ESP_LOGE(TAG, "UploadTask: BuildWavFromPcm failed");
+        PostUiIfAlive(alive, [self]() {
+            self->busy_ = false;
+            self->model_.loading = false;
+            self->model_.status_line = "编码失败";
+            self->Show(self->model_);
+        });
+        return;
+    }
+
+    PostUiIfAlive(alive, [self]() {
+        self->model_.status_line = "上传中…";
+        self->Show(self->model_);
+    });
+
+    ESP_LOGI(TAG, "UploadTask: wav %u bytes, uploading", static_cast<unsigned>(wav.size()));
+    int meeting_id = 0;
+    esp_err_t up = oye::UploadMeetingAudio(wav.data(), wav.size(), "设备录音", meeting_id);
+    ESP_LOGI(TAG, "UploadTask: upload err=%s meeting_id=%d", esp_err_to_name(up), meeting_id);
+    if (up != ESP_OK || meeting_id <= 0) {
+        PostUiIfAlive(alive, [self]() {
+            self->busy_ = false;
+            self->model_.loading = false;
+            self->model_.status_line = "上传失败";
+            self->Show(self->model_);
+        });
+        return;
+    }
+
+    ESP_LOGI(TAG, "UploadTask: poll meeting_id=%d", meeting_id);
+    oye::MeetingInfo info;
+    esp_err_t poll = oye::PollMeetingUntilDone(meeting_id, info, 300);
+    ESP_LOGI(TAG, "UploadTask: poll err=%s status=%s", esp_err_to_name(poll), info.status.c_str());
+
+    if (alive == nullptr || !alive->load()) {
+        ESP_LOGW(TAG, "UploadTask: page destroyed before UI update");
+        return;
+    }
+    PostUiIfAlive(alive, [self, poll, info = std::move(info)]() mutable {
+        self->busy_ = false;
+        self->model_.loading = false;
+        if (poll != ESP_OK) {
+            ESP_LOGW(TAG, "UploadTask UI: poll failed");
+            self->model_.status_line = "处理超时或失败";
+            self->Show(self->model_);
+            self->RefreshList();
+            return;
+        }
+        self->model_.show_detail = true;
+        self->model_.selected_id = info.id;
+        self->model_.detail_title = info.title.empty() ? "新会议" : info.title;
+        self->model_.detail_status = StatusText(info.status);
+        self->model_.detail_body = info.summary.empty() ? "纪要生成完成" : info.summary;
+        self->model_.status_line = "上传完成";
+        self->Show(self->model_);
+    });
+#else
+    (void)self;
+#endif
+}
+
+}  // namespace ui::meeting

@@ -21,8 +21,20 @@ public:
     /** 入队：前进到 id，新建页面根并压栈（盖在上一页 / 主界面上方）。 */
     void PostNavigateTo(UiPageId id);
 
+    /**
+     * 入队：销毁当前栈顶页再打开 to（释放栈顶 LVGL 内存）。
+     * 从 to 返回时若 restore_on_back 非 kNone，则重新创建该页并压栈（而非恢复旧实例）。
+     */
+    void PostNavigateToReplacingTop(UiPageId to, UiPageId restore_on_back);
+
     /** 入队：弹出并销毁栈顶页面根；栈空则无操作。 */
     void PostNavigateBack();
+
+    /**
+     * 从 LVGL 输入事件回调同步返回（持 Display 锁，不经过 ui_cmd 队列）。
+     * 用于右滑返回，避免 ui_cmd 被未加锁的 Show 卡住时无法出队。
+     */
+    void NavigateBackFromInput();
 
     /** 入队：循环出栈直到空，关掉所有叠在主页上的整页（露出 LcdDisplay 主界面）。 */
     void PostNavigateCloseAll();
@@ -34,10 +46,14 @@ private:
     UiPageRouter() = default;
 
     void ApplyNavigateTo(UiPageId id);
+    void ApplyNavigateToReplacingTop(UiPageId to, UiPageId restore_on_back);
     void ApplyNavigateBack();
+    void ApplyNavigateBackLocked();
     void ApplyNavigateCloseAll();
+    bool DestroyPageStackTop();
 
     Display* display_ = nullptr;
+    UiPageId restore_on_back_ = UiPageId::kNone;
     /** LVGL 下存 lv_obj_t*；非 LVGL 路径不压栈。 */
     void* PageStackPop();
     void PageStackPush(void* root);

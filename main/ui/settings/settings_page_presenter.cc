@@ -11,6 +11,7 @@ namespace ui::settings {
 namespace {
 
 constexpr uintptr_t kUserDataOpenStickerChat = 0x53544348u;  // 'STCH' — 与 lvgl_settings_page_view.cc 一致
+constexpr uintptr_t kUserDataOpenMeeting = 0x4D545047u;      // 'MTPG'
 
 }  // namespace
 
@@ -27,6 +28,10 @@ void SettingsPagePresenter::OnClick(lv_event_t* e) {
     lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_target(e));
     if (reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target)) == kUserDataOpenStickerChat) {
         UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(StickerChat));
+        return;
+    }
+    if (reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target)) == kUserDataOpenMeeting) {
+        UiPageRouter::Instance().PostNavigateToReplacingTop(UI_PAGE_ID(Meeting), UI_PAGE_ID(Settings));
         return;
     }
 

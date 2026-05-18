@@ -15,6 +15,7 @@
 #include "lvgl_qrcode_page_view.h"
 #include "lvgl_settings_page_view.h"
 #include "lvgl_sticker_chat_page_view.h"
+#include "lvgl_meeting_page_view.h"
 #include "lvgl_wifi_page_view.h"
 
 /** 登记 LVGL 整页：`X(枚举符号, View::CreateRouterPageRoot)`。 */
@@ -25,4 +26,5 @@
     UI_PAGE_LVGL_FACTORY(X, About, ui::about::LvglAboutPageView) \
     UI_PAGE_LVGL_FACTORY(X, StickerChat, ui::sticker_chat::LvglStickerChatPageView) \
     UI_PAGE_LVGL_FACTORY(X, QrCode, ui::qrcode::LvglQrCodePageView) \
+    UI_PAGE_LVGL_FACTORY(X, Meeting, ui::meeting::LvglMeetingPageView) \
     UI_PAGE_LVGL_FACTORY(X, Wifi, ui::wifi::LvglWifiPageView)
