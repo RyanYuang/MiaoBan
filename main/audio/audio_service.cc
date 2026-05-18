@@ -65,6 +65,9 @@ void AudioService::Initialize(AudioCodec* codec) {
     codec_ = codec;
     codec_->Start();
 
+    // esp-sr AFE: ringbuffer full when feed runs but fetch is idle (e.g. wake word stopped).
+    esp_log_level_set("AFE", ESP_LOG_ERROR);
+
     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(codec->output_sample_rate(), OPUS_FRAME_DURATION_MS);
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
     if (opus_decoder_ == nullptr) {
