@@ -30,6 +30,7 @@ struct StickerChatQuickSettingsCtx {
     static constexpr int kQuickBtnCount = 6;
     lv_obj_t* quick_btns[kQuickBtnCount]{};
     bool quick_on[kQuickBtnCount]{};
+    bool suppress_quick_click[kQuickBtnCount]{};
     QsBtnCtx quick_btn_ctx[kQuickBtnCount]{};
 
     static constexpr unsigned kMaxDragSources = 16;
@@ -98,6 +99,21 @@ static void apply_round_toggle_visual(lv_obj_t* btn, bool on)
     }
 }
 
+static void on_quick_btn_long_pressed(lv_event_t* e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) {
+        return;
+    }
+    auto* bc = static_cast<QsBtnCtx*>(lv_event_get_user_data(e));
+    if (bc == nullptr || bc->qs == nullptr) {
+        return;
+    }
+    if (bc->idx == 0) {
+        bc->qs->suppress_quick_click[0] = true;
+        UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(Wifi));
+    }
+}
+
 static void on_quick_btn_click(lv_event_t* e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
@@ -110,6 +126,10 @@ static void on_quick_btn_click(lv_event_t* e)
     StickerChatQuickSettingsCtx* c = bc->qs;
     const int idx = bc->idx;
     if (idx < 0 || idx >= StickerChatQuickSettingsCtx::kQuickBtnCount) {
+        return;
+    }
+    if (c->suppress_quick_click[idx]) {
+        c->suppress_quick_click[idx] = false;
         return;
     }
     if (idx == 5) {
@@ -473,6 +493,7 @@ void* sticker_chat_quick_settings_create(lv_obj_t* parent, Display* display, Lvg
         c->quick_btn_ctx[i].qs = c;
         c->quick_btn_ctx[i].idx = i;
         lv_obj_add_event_cb(btn, on_quick_btn_click, LV_EVENT_CLICKED, &c->quick_btn_ctx[i]);
+        lv_obj_add_event_cb(btn, on_quick_btn_long_pressed, LV_EVENT_LONG_PRESSED, &c->quick_btn_ctx[i]);
         lv_obj_t* lab = lv_label_create(btn);
         lv_label_set_text(lab, kQuickLbls[i]);
         lv_obj_set_style_text_font(lab, theme->text_font()->font(), 0);

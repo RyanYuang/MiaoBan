@@ -51,9 +51,11 @@ set(SOURCES "audio/audio_codec.cc"
             "ui/about/about_page_presenter.cc"
             "ui/about/lvgl_about_page_view.cc"
             "ui/qrcode/lvgl_qrcode_page_view.cc"
+            "ui/wifi/wifi_page_presenter.cc"
+            "ui/wifi/lvgl_wifi_page_view.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp" "ui" "ui/settings" "ui/about" "ui/sticker_chat" "ui/qrcode")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "ui/mvp" "ui" "ui/settings" "ui/about" "ui/sticker_chat" "ui/qrcode" "ui/wifi")
 
 # Add board common files
 list(APPEND SOURCES

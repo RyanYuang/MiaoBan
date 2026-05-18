@@ -140,6 +140,9 @@ void UiPageRouter::ApplyNavigateTo(UiPageId id) {
         case UiPageId::kQrCode:
             display_->ShowNotification("QR code", 60000);
             break;
+        case UiPageId::kWifi:
+            display_->ShowNotification("Wi-Fi", 60000);
+            break;
         default:
             break;
     }

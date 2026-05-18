@@ -14,7 +14,8 @@
     X(Home, 1)            \
     X(About, 2)           \
     X(StickerChat, 3)     \
-    X(QrCode, 4)
+    X(QrCode, 4)          \
+    X(Wifi, 5)
 
 enum class UiPageId : uint8_t {
 #define UI_PAGE_EXPAND_ENUM(sym, ord) k##sym = ord,

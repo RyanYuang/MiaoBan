@@ -3,6 +3,7 @@
 #include "display.h"
 #include "application.h"
 #include "ui_command_dispatcher.h"
+#include "wifi_page_presenter.h"
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
@@ -69,6 +70,9 @@ void WifiBoard::StartNetwork() {
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
     wifi_manager.Initialize(config);
+
+    /* 须在 StartStation 之前注册，使 SCAN_DONE 时先于 WifiStation 读取 AP 缓存 */
+    ui::wifi::RegisterWifiScanEventHandler();
 
     // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
