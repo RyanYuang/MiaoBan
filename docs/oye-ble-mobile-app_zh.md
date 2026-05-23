@@ -2,10 +2,12 @@
 
 本文档面向 **iOS / Android** 客户端工程师，说明如何扫描设备、完成蓝牙配对（Bond）、通过 GATT 收发 **Protobuf** 消息，并完成 Wi‑Fi 配网、OTA 信息查询与用户账号绑定。
 
-固件侧概要文档见 [oye-ble-proto_zh.md](./oye-ble-proto_zh.md)。协议唯一源文件：
+固件侧概要文档见 [oye-ble-proto_zh.md](./oye-ble-proto_zh.md)。设备联网后 HTTP API 见 [oye-mcu-http-api_zh.md](./oye-mcu-http-api_zh.md)。
 
-- [`proto/oye/device/v1/device.proto`](../proto/oye/device/v1/device.proto)
-- [`proto/oye/device/v1/device.options`](../proto/oye/device/v1/device.options)（字符串长度等 nanopb 限制，App 侧应遵守相同上限）
+协议唯一源文件（本仓库）：
+
+- [`Flutter/oyeo2app/proto/oye/device/v1/device.proto`](../Flutter/oyeo2app/proto/oye/device/v1/device.proto)
+- 字符串长度上限与固件 `device.options` 一致，App 侧应遵守相同约束
 
 ---
 
@@ -341,18 +343,22 @@ sequenceDiagram
 
 ## 9. 生成移动端 Protobuf 代码
 
-仓库根目录执行（需 `protoc` + `nanopb` 或各平台标准 `protoc` 插件）：
+Flutter 工程已包含生成代码：`Flutter/oyeo2app/lib/device/generated/oye/device/v1/`。
+
+重新生成（在 `Flutter/oyeo2app` 目录，需 `protoc` 与 `protoc_plugin`）：
 
 ```bash
-./proto/generate.sh
+cd Flutter/oyeo2app
+dart run protoc_plugin:protoc --dart_out=lib/device/generated -Iproto proto/oye/device/v1/device.proto
 ```
 
 | 平台 | 建议 |
 |------|------|
-| **Android** | `protobuf-java` 或 `protobuf-kotlin`，自 `device.proto` 生成；Gradle 引用与固件相同 proto 文件。 |
-| **iOS** | SwiftProtobuf / `protobuf` Objective-C，将 `device.proto` 加入 Xcode 生成 target。 |
+| **Flutter（本 App）** | 使用上述命令，包名 `oye.device.v1` |
+| **Android 原生** | `protobuf-java` / Kotlin，引用同一 `device.proto` |
+| **iOS 原生** | SwiftProtobuf，引用同一 `device.proto` |
 
-包名保持 `oye.device.v1`，避免与固件字段号不一致。
+字段号与 `package oye.device.v1` 必须与固件一致。
 
 ---
 
@@ -402,9 +408,10 @@ sequenceDiagram
 
 | 文件 | 说明 |
 |------|------|
-| [`proto/oye/device/v1/device.proto`](../proto/oye/device/v1/device.proto) | 协议定义 |
-| [`main/ble/oye_ble_service.cc`](../main/ble/oye_ble_service.cc) | GATT / 广播 / Bond |
-| [`main/ble/oye_ble_codec.cc`](../main/ble/oye_ble_codec.cc) | Chunk 组包 |
-| [`main/ble/oye_ble_commands.cc`](../main/ble/oye_ble_commands.cc) | 命令业务逻辑 |
+| [`device.proto`](../Flutter/oyeo2app/proto/oye/device/v1/device.proto) | 协议定义 |
+| [`oye_ble_client.dart`](../Flutter/oyeo2app/lib/device/oye_ble_client.dart) | App BLE 客户端实现 |
+| [`oye_ble_chunk_codec.dart`](../Flutter/oyeo2app/lib/device/oye_ble_chunk_codec.dart) | 分片编解码 |
+| [oye-ble-proto_zh.md](./oye-ble-proto_zh.md) | 固件 GATT / 命令说明 |
+| [oye-mcu-http-api_zh.md](./oye-mcu-http-api_zh.md) | MCU 云端 HTTP（token 写入后的业务） |
 
-如有协议变更，以仓库内 `device.proto` 与固件提交为准。
+如有协议变更，以 `device.proto` 与固件仓库提交为准，并同步更新上述文档。

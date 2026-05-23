@@ -27,8 +27,6 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lvgl_display/jpg/image_to_jpeg.cpp"
             "display/lvgl_display/jpg/jpeg_to_image.c"
             "protocols/protocol.cc"
-            "protocols/mqtt_protocol.cc"
-            "protocols/websocket_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -867,6 +865,13 @@ if(CONFIG_USE_OYE_BLE_PROVISIONING)
     )
 endif()
 
+if(NOT CONFIG_USE_OYE_CLOUD_API)
+    list(APPEND SOURCES
+        "protocols/mqtt_protocol.cc"
+        "protocols/websocket_protocol.cc"
+    )
+endif()
+
 if(CONFIG_USE_OYE_CLOUD_API)
     list(APPEND SOURCES
         "ui/meeting/meeting_emote_ui.cc"
@@ -874,6 +879,8 @@ if(CONFIG_USE_OYE_CLOUD_API)
         "oye/oye_http.cc"
         "oye/oye_cloud_api.cc"
         "oye/oye_meeting_stream.cc"
+        "oye/oye_voice_chat_stream.cc"
+        "oye/oye_tts_stream.cc"
         "oye/oye_audio_util.cc"
         "oye/oye_mcp_tools.cc"
         "protocols/oye_chat_protocol.cc"

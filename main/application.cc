@@ -4,9 +4,11 @@
 #include "display.h"
 #include "system_info.h"
 #include "audio_codec.h"
+#include "assets/lang_config.h"
+#if !CONFIG_USE_OYE_CLOUD_API
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
-#include "assets/lang_config.h"
+#endif
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
@@ -119,9 +121,11 @@ void Application::Initialize() {
     audio_service_.Start();
 
     AudioServiceCallbacks callbacks;
+#if !CONFIG_USE_OYE_CLOUD_API
     callbacks.on_send_queue_available = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
+#endif
     callbacks.on_wake_word_detected = [this](const std::string& wake_word) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
@@ -275,15 +279,15 @@ void Application::Run() {
             HandleStopListeningEvent();
         }
 
+#if !CONFIG_USE_OYE_CLOUD_API
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            // 将编码后的音频包从发送队列搬运到协议层发送。
-            // ESP_LOGI(TAG, "================= RyanYuang MAIN_EVENT_SEND_AUDIO ==================");
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
             }
         }
+#endif
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
             // 唤醒词命中后决定是否开通音频通道并进入监听。
@@ -580,7 +584,8 @@ void Application::CheckNewVersion() {
 }
 
 /**
- * 按 OTA 配置创建 MQTT 或 WebSocket 协议实例，注册各类回调（音频、JSON、通道开关、错误），并启动协议。
+ * 创建语音对话协议实例并注册回调。
+ * Oye 固件：仅 OyeChatProtocol（会议 WS ASR + HTTP 对话）；否则为小智 MQTT/WebSocket。
  */
 void Application::InitializeProtocol() {
     auto& board = Board::GetInstance();
@@ -592,13 +597,16 @@ void Application::InitializeProtocol() {
     });
 
 #if CONFIG_USE_OYE_CLOUD_API
-    if (oye::HasAccessToken()) {
+    {
         auto oye_proto = std::make_unique<OyeChatProtocol>();
         oye_proto->SetMainScheduler([this](std::function<void()> fn) { Schedule(std::move(fn)); });
         protocol_ = std::move(oye_proto);
-        ESP_LOGI(TAG, "Using Oye cloud HTTP voice protocol");
-    } else
-#endif
+        ESP_LOGI(TAG, "Voice protocol: Oye cloud (Xiaozhi MQTT/WS disabled)");
+        if (!oye::HasAccessToken()) {
+            ESP_LOGW(TAG, "No access_token yet; bind via BLE SET_USER_TOKEN before chat");
+        }
+    }
+#else
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
@@ -607,6 +615,7 @@ void Application::InitializeProtocol() {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
     }
+#endif
 
     protocol_->OnConnected([this]() {
         UiCommandDispatcher::Instance().Post([this]() {
@@ -827,41 +836,53 @@ void Application::StopListening() {
  */
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
-    
+
+    // --- 非对话态：按键作为「取消/切换」的快捷路径 ---
+
     if (state == kDeviceStateActivating) {
+        // 激活过程中再次按键 → 取消激活，回到待机
         SetDeviceState(kDeviceStateIdle);
         return;
     } else if (state == kDeviceStateWifiConfiguring) {
+        // 配网界面按键 → 进入本地音频回环测试（验麦/喇叭）
         audio_service_.EnableAudioTesting(true);
         SetDeviceState(kDeviceStateAudioTesting);
         return;
     } else if (state == kDeviceStateAudioTesting) {
+        // 音频测试中再次按键 → 退出测试，回到配网
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
         return;
     }
 
+    // --- 正常对话路径：依赖云端协议 ---
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
     }
 
     if (state == kDeviceStateIdle) {
+        // 待机 → 开始一轮对话：先建音频通道，再按默认模式进入聆听
         ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
+            // 通道未建立：先切到「连接中」刷新 UI，再异步开通道（避免阻塞主循环）
             SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
             Schedule([this, mode]() {
                 ContinueOpenAudioChannel(mode);
             });
             return;
         }
+        // 通道已存在（例如上一轮未完全断开）→ 直接开始聆听
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
+        // 播报中按键 → 打断 TTS，由协议/状态机后续切回聆听或待机
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
-        protocol_->CloseAudioChannel();
+        // 聆听中按键 → 通知服务端停止收音，回到待机
+        protocol_->SendStopListening();
+        SetDeviceState(kDeviceStateIdle);
     }
+    // 其他状态（Connecting、Upgrading 等）在此不做处理
 }
 
 /**
@@ -1056,19 +1077,12 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
-            // 确保音频处理器已运行
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // 自动停止模式：先等播放队列为空再开启语音处理，
-                // 避免网络抖动导致 STOP 迟到时截断播放。
-                if (listening_mode_ == kListeningModeAutoStop) {
-                    audio_service_.WaitForPlaybackQueueEmpty();
-                }
-                
-                // 通知服务端开始监听
-                protocol_->SendStartListening(listening_mode_);
-                // 打开采集与编码，向服务端上行音频。
-                audio_service_.EnableVoiceProcessing(true);
+            // 自动停止模式：先等播放队列为空再开麦，避免截断 TTS。
+            if (listening_mode_ == kListeningModeAutoStop) {
+                audio_service_.WaitForPlaybackQueueEmpty();
             }
+            // 先建 WS 再开麦（见 OyeChatProtocol::SendStartListening），避免握手期间堆 PCM 占满内存。
+            protocol_->SendStartListening(listening_mode_);
 
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
             // 在聆听模式下启用唤醒词检测（由 Kconfig 配置）
@@ -1142,7 +1156,11 @@ void Application::SetListeningMode(ListeningMode mode) {
  * 由 AEC 配置推导默认聆听模式：无 AEC 用自动停止，否则用实时模式。
  */
 ListeningMode Application::GetDefaultListeningMode() const {
+#if CONFIG_USE_OYE_CLOUD_API
+    return kListeningModeManualStop;
+#else
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
+#endif
 }
 
 /**
@@ -1247,10 +1265,15 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
         });
-    } else if (state == kDeviceStateListening) {   
+    } else if (state == kDeviceStateListening) {
         Schedule([this]() {
             if (protocol_) {
+#if CONFIG_USE_OYE_CLOUD_API
+                protocol_->SendStopListening();
+                SetDeviceState(kDeviceStateIdle);
+#else
                 protocol_->CloseAudioChannel();
+#endif
             }
         });
     }

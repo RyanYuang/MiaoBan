@@ -1,6 +1,7 @@
-#include "oye_meeting_stream.h"
+#include "oye_voice_chat_stream.h"
 
 #include "oye_config.h"
+#include "oye_tts_stream.h"
 
 #include <board.h>
 #include <cJSON.h>
@@ -8,14 +9,17 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <mbedtls/base64.h>
 #include <web_socket.h>
 
+#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 namespace oye {
 
-static const char* TAG = "OyeMeetingWs";
+static const char* TAG = "OyeVoiceWs";
 
 namespace {
 
@@ -23,7 +27,6 @@ constexpr size_t kLogTextMax = 160;
 constexpr size_t kMinLargestInternalForWs = 4096;
 constexpr int kWsConnectAttempts = 3;
 constexpr int kWsRetryDelayMs = 400;
-// Stack in SPIRAM (see StartSendTask); WebSocket::Send needs headroom beyond frame buffer.
 constexpr int kSendTaskStackWords = 6144;
 constexpr int kSendTaskStackWordsInternalFallback = 2560;
 constexpr UBaseType_t kSendTaskPriority = 5;
@@ -51,13 +54,33 @@ bool HeapOkForWs() {
     return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= kMinLargestInternalForWs;
 }
 
+bool DecodeBase64(const char* in, size_t in_len, std::vector<uint8_t>& out) {
+    out.clear();
+    if (in == nullptr || in_len == 0) {
+        return true;
+    }
+    size_t olen = 0;
+    const int rc = mbedtls_base64_decode(nullptr, 0, &olen, reinterpret_cast<const unsigned char*>(in), in_len);
+    if (rc != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && rc != 0) {
+        return false;
+    }
+    out.resize(olen);
+    if (mbedtls_base64_decode(out.data(), out.size(), &olen, reinterpret_cast<const unsigned char*>(in),
+                              in_len) != 0) {
+        out.clear();
+        return false;
+    }
+    out.resize(olen);
+    return true;
+}
+
 }  // namespace
 
-MeetingStream::MeetingStream() {
+VoiceChatStream::VoiceChatStream() {
     done_event_ = xEventGroupCreate();
 }
 
-MeetingStream::~MeetingStream() {
+VoiceChatStream::~VoiceChatStream() {
     Stop(false);
     if (done_event_ != nullptr) {
         vEventGroupDelete(done_event_);
@@ -65,7 +88,7 @@ MeetingStream::~MeetingStream() {
     }
 }
 
-void MeetingStream::EnterTransportBoost() {
+void VoiceChatStream::EnterTransportBoost() {
     if (!transport_boost_) {
         LogHeap("WS transport boost begin");
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
@@ -73,7 +96,7 @@ void MeetingStream::EnterTransportBoost() {
     }
 }
 
-void MeetingStream::LeaveTransportBoost() {
+void VoiceChatStream::LeaveTransportBoost() {
     if (transport_boost_) {
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         transport_boost_ = false;
@@ -81,11 +104,7 @@ void MeetingStream::LeaveTransportBoost() {
     }
 }
 
-std::string MeetingStream::BuildWsUrl() {
-    return BuildWebSocketUrl("/meetings/stream/ws");
-}
-
-bool MeetingStream::InitPcmQueue() {
+bool VoiceChatStream::InitPcmQueue() {
     DestroyPcmQueue();
     pcm_queue_storage_ = static_cast<uint8_t*>(
         heap_caps_malloc(kPcmFrameBytes * kPcmQueueDepth, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -99,7 +118,6 @@ bool MeetingStream::InitPcmQueue() {
     }
     pcm_queue_ = xQueueCreateStatic(kPcmQueueDepth, kPcmFrameBytes, pcm_queue_storage_, &pcm_queue_buffer_);
     if (pcm_queue_ == nullptr) {
-        ESP_LOGE(TAG, "InitPcmQueue: xQueueCreateStatic failed");
         heap_caps_free(pcm_queue_storage_);
         pcm_queue_storage_ = nullptr;
         return false;
@@ -107,7 +125,7 @@ bool MeetingStream::InitPcmQueue() {
     return true;
 }
 
-void MeetingStream::DestroyPcmQueue() {
+void VoiceChatStream::DestroyPcmQueue() {
     if (pcm_queue_ != nullptr) {
         vQueueDelete(pcm_queue_);
         pcm_queue_ = nullptr;
@@ -118,11 +136,11 @@ void MeetingStream::DestroyPcmQueue() {
     }
 }
 
-void MeetingStream::SendTaskEntry(void* arg) {
-    static_cast<MeetingStream*>(arg)->PcmSendTask();
+void VoiceChatStream::SendTaskEntry(void* arg) {
+    static_cast<VoiceChatStream*>(arg)->PcmSendTask();
 }
 
-void MeetingStream::FreeSendTaskResources() {
+void VoiceChatStream::FreeSendTaskResources() {
     if (send_task_stack_ != nullptr) {
         heap_caps_free(send_task_stack_);
         send_task_stack_ = nullptr;
@@ -133,7 +151,7 @@ void MeetingStream::FreeSendTaskResources() {
     }
 }
 
-bool MeetingStream::StartSendTask() {
+bool VoiceChatStream::StartSendTask() {
     FreeSendTaskResources();
     send_task_run_ = true;
     xEventGroupClearBits(done_event_, kSendTaskExitBit);
@@ -143,7 +161,7 @@ bool MeetingStream::StartSendTask() {
     send_task_tcb_ =
         static_cast<StaticTask_t*>(heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
     if (send_task_stack_ != nullptr && send_task_tcb_ != nullptr) {
-        send_task_handle_ = xTaskCreateStatic(SendTaskEntry, "oye_ws_pcm", kSendTaskStackWords, this,
+        send_task_handle_ = xTaskCreateStatic(SendTaskEntry, "oye_vc_pcm", kSendTaskStackWords, this,
                                               kSendTaskPriority, send_task_stack_, send_task_tcb_);
         if (send_task_handle_ != nullptr) {
             ESP_LOGI(TAG, "PCM send task created (SPIRAM stack %d words)", kSendTaskStackWords);
@@ -157,8 +175,8 @@ bool MeetingStream::StartSendTask() {
     }
 
     LogHeap("StartSendTask fallback");
-    if (xTaskCreate(SendTaskEntry, "oye_ws_pcm", kSendTaskStackWordsInternalFallback, this,
-                    kSendTaskPriority, &send_task_handle_) != pdPASS) {
+    if (xTaskCreate(SendTaskEntry, "oye_vc_pcm", kSendTaskStackWordsInternalFallback, this, kSendTaskPriority,
+                    &send_task_handle_) != pdPASS) {
         send_task_run_ = false;
         send_task_handle_ = nullptr;
         ESP_LOGE(TAG, "StartSendTask: xTaskCreate failed (need largest>=%u)",
@@ -169,25 +187,20 @@ bool MeetingStream::StartSendTask() {
     return true;
 }
 
-void MeetingStream::StopSendTask() {
+void VoiceChatStream::StopSendTask() {
     send_task_run_ = false;
     if (send_task_handle_ == nullptr) {
         FreeSendTaskResources();
         return;
     }
-    const EventBits_t bits =
-        xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, pdMS_TO_TICKS(3000));
-    if ((bits & kSendTaskExitBit) == 0) {
-        ESP_LOGW(TAG, "StopSendTask: send task exit timeout");
-    }
+    xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, pdMS_TO_TICKS(3000));
     send_task_handle_ = nullptr;
     FreeSendTaskResources();
 }
 
-void MeetingStream::PcmSendTask() {
-    ESP_LOGI(TAG, "PCM send task started (stack=%d words)", kSendTaskStackWords);
+void VoiceChatStream::PcmSendTask() {
     // 独立发送任务：从 pcm_queue_ 取 60ms 定长帧并经 WebSocket 二进制上行。
-    // FeedPcm 只负责非阻塞入队，避免在音频回调里执行 Send 阻塞采集链路。
+    // FeedPcm 只负责拼帧入队，避免在音频回调里执行 Send 阻塞采集链路。
     while (send_task_run_) {
         // 100ms 超时：队列空时也能周期性检查 send_task_run_，Stop 时可及时退出。
         if (xQueueReceive(pcm_queue_, send_frame_, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -204,16 +217,15 @@ void MeetingStream::PcmSendTask() {
             SendPcmChunk(send_frame_, kPcmFrameSamples);
         }
     }
-    ESP_LOGI(TAG, "PCM send task exit (feeds=%u drops=%u)", static_cast<unsigned>(pcm_feed_count_),
-             static_cast<unsigned>(pcm_queue_drops_));
     send_task_handle_ = nullptr;
     xEventGroupSetBits(done_event_, kSendTaskExitBit);
     vTaskDelete(nullptr);
 }
 
-bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallback on_asr,
-                          DoneCallback on_done) {
-    ESP_LOGI(TAG, "Start title=%s save_meeting=%d", title.c_str(), save_meeting ? 1 : 0);
+bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallback on_asr_final,
+                            TextCallback on_llm_text, std::function<void(const char* state)> on_tts_state,
+                            DoneCallback on_done, ErrorCallback on_error) {
+    ESP_LOGI(TAG, "Start chat_session_id=%d", chat_session_id);
     Stop(false);
     if (!HasAccessToken()) {
         ESP_LOGE(TAG, "Start: no access token");
@@ -221,11 +233,20 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
     }
 
     on_asr_ = std::move(on_asr);
+    on_asr_final_ = std::move(on_asr_final);
+    on_llm_text_ = std::move(on_llm_text);
+    on_tts_state_ = std::move(on_tts_state);
     on_done_ = std::move(on_done);
-    save_meeting_ = save_meeting;
+    on_error_ = std::move(on_error);
     pcm_feed_count_ = 0;
     pcm_bytes_sent_ = 0;
     pcm_queue_drops_ = 0;
+    pcm_accum_trims_ = 0;
+    pcm_accum_.clear();
+    pcm_accum_.reserve(kPcmAccumMaxSamples);
+    next_tts_seq_ = 0;
+    user_text_.clear();
+    assistant_text_.clear();
     stream_ready_ = false;
     session_finished_ = false;
     if (done_event_ != nullptr) {
@@ -236,7 +257,6 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
         LogHeap("Start: reject WS (low internal heap)");
         return false;
     }
-
     if (!InitPcmQueue()) {
         return false;
     }
@@ -247,14 +267,13 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
     auto network = Board::GetInstance().GetNetwork();
     std::unique_ptr<WebSocket> ws = network->CreateWebSocket(2);
     if (ws == nullptr) {
-        ESP_LOGE(TAG, "Start: CreateWebSocket failed");
         DestroyPcmQueue();
         LeaveTransportBoost();
         return false;
     }
 
-    std::string url = BuildWsUrl();
-    ESP_LOGI(TAG, "WS connect (token redacted) path=%s/meetings/stream/ws", kApiPrefix);
+    const std::string url = BuildWebSocketUrl("/voice-chat/ws");
+    ESP_LOGI(TAG, "WS connect (token redacted) path=%s/voice-chat/ws", kApiPrefix);
     ws->OnData([this](const char* data, size_t len, bool binary) {
         if (!binary && data != nullptr && len > 0) {
             HandleText(data, len);
@@ -273,7 +292,6 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
     bool connected = false;
     for (int attempt = 1; attempt <= kWsConnectAttempts; ++attempt) {
         if (!HeapOkForWs()) {
-            LogHeap("WS connect skipped (heap)");
             break;
         }
         ESP_LOGI(TAG, "WS connect attempt %d/%d", attempt, kWsConnectAttempts);
@@ -286,7 +304,6 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
         }
     }
     if (!connected) {
-        ESP_LOGE(TAG, "WS connect failed after %d attempts", kWsConnectAttempts);
         DestroyPcmQueue();
         LeaveTransportBoost();
         return false;
@@ -297,9 +314,11 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
 
     cJSON* start = cJSON_CreateObject();
     cJSON_AddStringToObject(start, "action", "start");
-    cJSON_AddStringToObject(start, "title", title.c_str());
-    cJSON_AddBoolToObject(start, "save_meeting", save_meeting);
-    cJSON_AddNullToObject(start, "group_id");
+    if (chat_session_id > 0) {
+        cJSON_AddNumberToObject(start, "chat_session_id", chat_session_id);
+    } else {
+        cJSON_AddNullToObject(start, "chat_session_id");
+    }
     cJSON* audio = cJSON_CreateObject();
     cJSON_AddStringToObject(audio, "format", "pcm");
     cJSON_AddNumberToObject(audio, "rate", 16000);
@@ -317,7 +336,7 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
         Stop(false);
         return false;
     }
-    ESP_LOGI(TAG, "sent start JSON: pcm 16kHz mono s16le save_meeting=%d", save_meeting ? 1 : 0);
+    ESP_LOGI(TAG, "sent start JSON: pcm 16kHz mono s16le");
 
     if (!StartSendTask()) {
         Stop(false);
@@ -329,28 +348,50 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
     return true;
 }
 
-bool MeetingStream::SendPcmChunk(const int16_t* samples, size_t count) {
+/**
+ * 将一帧 PCM 以 WebSocket 二进制帧发送到 /voice-chat/ws。
+ * 由 PcmSendTask 从队列取出定长帧（默认 960 样点 ≈ 60ms @16kHz）后调用，不在音频回调里直接 Send。
+ *
+ * @param samples 16-bit 单声道 PCM 缓冲区
+ * @param count   样点数（通常 kPcmFrameSamples=960）
+ * @return 发送成功 true；参数无效、未连接或 Send 失败 false
+ */
+bool VoiceChatStream::SendPcmChunk(const int16_t* samples, size_t count) {
+    printf("SendPcmChunk: %p\n", samples);
+    // 无 socket、空指针或 0 长度 → 直接失败（调用方应保证 count 为整帧）
     if (websocket_ == nullptr || samples == nullptr || count == 0) {
+        printf("SendPcmChunk: invalid parameters\n");
         return false;
     }
     auto* socket = static_cast<WebSocket*>(websocket_);
+    // 连接已断：标记 stream 不可用，后续 FeedPcm 入队帧会在发送任务里被丢弃
     if (!socket->IsConnected()) {
+        printf("SendPcmChunk: not connected\n");
         stream_ready_ = false;
         return false;
     }
+
     const size_t bytes = count * sizeof(int16_t);
+    // binary=true：服务端按二进制 PCM 解析（s16le 16kHz mono，与 start JSON 中 audio 一致）
     if (!socket->Send(reinterpret_cast<const char*>(samples), bytes, true)) {
+        printf("SendPcmChunk: send failed: %d\n", socket->GetLastError());
         if (!socket->IsConnected()) {
+            // 发送过程中断线：停流并清 stream_ready_，避免继续往死连接写数据
             stream_ready_ = false;
             running_ = false;
             ESP_LOGW(TAG, "WS send failed, connection lost (feeds=%u bytes=%u err=%d)",
                      static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                      socket->GetLastError());
         } else {
-            ESP_LOGW(TAG, "binary PCM send failed (%u bytes)", static_cast<unsigned>(bytes));
+            // 仍显示 connected 但 Send 失败（缓冲满、TLS 等），本帧丢弃，不立刻停会话
+            ESP_LOGW(TAG, "binary PCM send failed (%u bytes) err=%d", static_cast<unsigned>(bytes),
+                     socket->GetLastError());
         }
         return false;
     }
+    printf("SendPcmChunk: send success\n");
+
+    // 统计上行：首帧与每 50 帧打一次日志，便于确认麦数据是否真的发出
     ++pcm_feed_count_;
     pcm_bytes_sent_ += bytes;
     if (pcm_feed_count_ == 1) {
@@ -362,24 +403,54 @@ bool MeetingStream::SendPcmChunk(const int16_t* samples, size_t count) {
     return true;
 }
 
-void MeetingStream::FeedPcm(const int16_t* samples, size_t count) {
-    if (!running_ || !stream_ready_ || pcm_queue_ == nullptr || samples == nullptr || count == 0) {
-        return;
-    }
-    if (count != kPcmFrameSamples) {
-        ESP_LOGW(TAG, "FeedPcm: unexpected frame size %u (expected %u)", static_cast<unsigned>(count),
-                 static_cast<unsigned>(kPcmFrameSamples));
-        return;
-    }
-    if (xQueueSend(pcm_queue_, samples, 0) != pdTRUE) {
-        ++pcm_queue_drops_;
-        if ((pcm_queue_drops_ % 20) == 1) {
-            ESP_LOGW(TAG, "PCM queue full, dropped frame (drops=%u)", static_cast<unsigned>(pcm_queue_drops_));
+void VoiceChatStream::TrimPcmAccumIfNeeded() {
+    while (pcm_accum_.size() > kPcmAccumMaxSamples) {
+        size_t excess = pcm_accum_.size() - kPcmAccumMaxSamples;
+        size_t drop = (excess / kPcmFrameSamples) * kPcmFrameSamples;
+        if (drop == 0) {
+            drop = excess;
+        }
+        pcm_accum_.erase(pcm_accum_.begin(), pcm_accum_.begin() + drop);
+        ++pcm_accum_trims_;
+        if ((pcm_accum_trims_ % 10) == 1) {
+            ESP_LOGW(TAG, "pcm_accum trimmed oldest (trims=%u accum=%u max=%u)",
+                     static_cast<unsigned>(pcm_accum_trims_), static_cast<unsigned>(pcm_accum_.size()),
+                     static_cast<unsigned>(kPcmAccumMaxSamples));
         }
     }
 }
 
-void MeetingStream::SignalSessionEnd() {
+void VoiceChatStream::FlushPcmAccumToQueue() {
+    if (pcm_queue_ == nullptr) {
+        return;
+    }
+    while (pcm_accum_.size() >= kPcmFrameSamples) {
+        if (xQueueSend(pcm_queue_, pcm_accum_.data(), 0) != pdTRUE) {
+            printf("FlushPcmAccumToQueue: failed\n");
+            ++pcm_queue_drops_;
+            if ((pcm_queue_drops_ % 10) == 1) {
+                ESP_LOGW(TAG, "PCM queue full, dropped frame (drops=%u accum=%u)",
+                         static_cast<unsigned>(pcm_queue_drops_),
+                         static_cast<unsigned>(pcm_accum_.size()));
+            }
+            TrimPcmAccumIfNeeded();
+            return;
+        }
+        printf("FlushPcmAccumToQueue: success\n");
+        pcm_accum_.erase(pcm_accum_.begin(), pcm_accum_.begin() + kPcmFrameSamples);
+    }
+}
+
+void VoiceChatStream::FeedPcm(const int16_t* samples, size_t count) {
+    if (!running_ || !stream_ready_ || pcm_queue_ == nullptr || samples == nullptr || count == 0) {
+        return;
+    }
+    pcm_accum_.insert(pcm_accum_.end(), samples, samples + count);
+    TrimPcmAccumIfNeeded();
+    FlushPcmAccumToQueue();
+}
+
+void VoiceChatStream::SignalSessionEnd() {
     if (session_finished_) {
         return;
     }
@@ -389,112 +460,161 @@ void MeetingStream::SignalSessionEnd() {
     }
 }
 
-void MeetingStream::CloseWebSocket() {
+void VoiceChatStream::CloseWebSocket() {
     if (websocket_ != nullptr) {
         delete static_cast<WebSocket*>(websocket_);
         websocket_ = nullptr;
     }
 }
 
-void MeetingStream::Stop(bool wait_for_done) {
+void VoiceChatStream::Stop(bool wait_for_done) {
     if (!running_ && websocket_ == nullptr && !transport_boost_ && send_task_handle_ == nullptr) {
         return;
     }
 
     stream_ready_ = false;
     running_ = false;
+    FlushPcmAccumToQueue();
     StopSendTask();
     DestroyPcmQueue();
+    pcm_accum_.clear();
 
     if (websocket_ != nullptr) {
-        ESP_LOGI(TAG, "Stop: sending end (feeds=%u bytes=%u drops=%u wait_done=%d)",
+        ESP_LOGI(TAG, "Stop: sending end (feeds=%u bytes=%u wait_done=%d)",
                  static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
-                 static_cast<unsigned>(pcm_queue_drops_), wait_for_done ? 1 : 0);
+                 wait_for_done ? 1 : 0);
         auto* socket = static_cast<WebSocket*>(websocket_);
         if (!socket->Send(R"({"action":"end"})")) {
-            ESP_LOGW(TAG, "send end JSON failed, closing WS");
             wait_for_done = false;
         }
 
         if (wait_for_done && !session_finished_ && done_event_ != nullptr) {
-            ESP_LOGI(TAG, "Stop: waiting for type=done (max %u ms)",
-                     static_cast<unsigned>(kDoneWaitTicks * portTICK_PERIOD_MS));
             const EventBits_t bits =
                 xEventGroupWaitBits(done_event_, kDoneReceivedBit, pdFALSE, pdTRUE, kDoneWaitTicks);
             if ((bits & kDoneReceivedBit) == 0) {
-                ESP_LOGW(TAG, "Stop: done timeout, closing WS anyway");
+                ESP_LOGW(TAG, "Stop: voice_chat_done timeout");
             }
         }
     }
 
+    WaitForMp3PlaybackDone();
     CloseWebSocket();
-    LogTextPreview("Stop: latest_text", latest_text_);
     LeaveTransportBoost();
 }
 
-std::string MeetingStream::LatestText() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return latest_text_;
-}
-
-void MeetingStream::HandleText(const char* data, size_t len) {
+void VoiceChatStream::HandleText(const char* data, size_t len) {
     std::string payload(data, len);
     cJSON* root = cJSON_Parse(payload.c_str());
     if (root == nullptr) {
-        ESP_LOGW(TAG, "HandleText: invalid JSON len=%u", static_cast<unsigned>(len));
         return;
     }
     auto type = cJSON_GetObjectItem(root, "type");
     if (!cJSON_IsString(type)) {
-        ESP_LOGW(TAG, "HandleText: missing type");
         cJSON_Delete(root);
         return;
     }
 
-    if (strcmp(type->valuestring, "asr") == 0) {
+    const char* t = type->valuestring;
+    if (strcmp(t, "asr") == 0) {
         auto text = cJSON_GetObjectItem(root, "text");
         if (cJSON_IsString(text)) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                latest_text_ = text->valuestring;
-            }
             LogTextPreview("WS asr", text->valuestring);
             if (on_asr_) {
                 on_asr_(text->valuestring);
             }
         }
-    } else if (strcmp(type->valuestring, "done") == 0) {
-        std::string final_text;
-        int meeting_id = 0;
+    } else if (strcmp(t, "asr_final") == 0) {
         auto text = cJSON_GetObjectItem(root, "text");
-        auto mid = cJSON_GetObjectItem(root, "meeting_id");
         if (cJSON_IsString(text)) {
-            final_text = text->valuestring;
-        }
-        if (cJSON_IsNumber(mid)) {
-            meeting_id = mid->valueint;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!final_text.empty()) {
-                latest_text_ = final_text;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                user_text_ = text->valuestring;
+            }
+            LogTextPreview("WS asr_final", text->valuestring);
+            if (on_asr_final_) {
+                on_asr_final_(text->valuestring);
             }
         }
-        LogTextPreview("WS done", latest_text_);
-        ESP_LOGI(TAG, "WS done meeting_id=%d", meeting_id);
+    } else if (strcmp(t, "llm_start") == 0) {
+        auto sid = cJSON_GetObjectItem(root, "chat_session_id");
+        ESP_LOGI(TAG, "WS llm_start session=%d", cJSON_IsNumber(sid) ? sid->valueint : -1);
+    } else if (strcmp(t, "llm_text") == 0) {
+        auto text = cJSON_GetObjectItem(root, "text");
+        if (cJSON_IsString(text)) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                assistant_text_ = text->valuestring;
+            }
+            LogTextPreview("WS llm_text", text->valuestring);
+            if (on_llm_text_) {
+                on_llm_text_(text->valuestring);
+            }
+        }
+    } else if (strcmp(t, "tts_start") == 0) {
+        next_tts_seq_ = 0;
+        ResetMp3Playback();
+        ESP_LOGI(TAG, "WS tts_start");
+        if (on_tts_state_) {
+            on_tts_state_("start");
+        }
+    } else if (strcmp(t, "tts_chunk") == 0) {
+        auto seq = cJSON_GetObjectItem(root, "seq");
+        auto data_b64 = cJSON_GetObjectItem(root, "data");
+        if (cJSON_IsNumber(seq) && cJSON_IsString(data_b64)) {
+            const int seq_val = seq->valueint;
+            if (seq_val != next_tts_seq_) {
+                ESP_LOGW(TAG, "tts_chunk seq=%d expected=%d", seq_val, next_tts_seq_);
+            }
+            std::vector<uint8_t> mp3;
+            if (DecodeBase64(data_b64->valuestring, strlen(data_b64->valuestring), mp3)) {
+                FeedMp3Playback(mp3.data(), mp3.size());
+                next_tts_seq_ = seq_val + 1;
+            }
+        }
+    } else if (strcmp(t, "tts_done") == 0) {
+        FlushMp3Playback();
+        ESP_LOGI(TAG, "WS tts_done");
+    } else if (strcmp(t, "voice_chat_done") == 0) {
+        int chat_session_id = 0;
+        auto ut = cJSON_GetObjectItem(root, "user_text");
+        auto at = cJSON_GetObjectItem(root, "assistant_text");
+        auto sid = cJSON_GetObjectItem(root, "chat_session_id");
+        if (cJSON_IsString(ut)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            user_text_ = ut->valuestring;
+        }
+        if (cJSON_IsString(at)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            assistant_text_ = at->valuestring;
+        }
+        if (cJSON_IsNumber(sid)) {
+            chat_session_id = sid->valueint;
+        }
+        std::string user_copy;
+        std::string assistant_copy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            user_copy = user_text_;
+            assistant_copy = assistant_text_;
+        }
+        ESP_LOGI(TAG, "WS voice_chat_done session=%d", chat_session_id);
+        if (on_tts_state_) {
+            on_tts_state_("stop");
+        }
         if (on_done_) {
-            on_done_(latest_text_, meeting_id);
+            on_done_(user_copy, assistant_copy, chat_session_id);
         }
         SignalSessionEnd();
-    } else if (strcmp(type->valuestring, "info") == 0) {
+    } else if (strcmp(t, "error") == 0) {
         auto msg = cJSON_GetObjectItem(root, "message");
-        ESP_LOGI(TAG, "WS info: %s", cJSON_IsString(msg) ? msg->valuestring : "(no message)");
-    } else if (strcmp(type->valuestring, "error") == 0) {
-        auto msg = cJSON_GetObjectItem(root, "message");
-        ESP_LOGE(TAG, "WS error: %s", cJSON_IsString(msg) ? msg->valuestring : "unknown");
+        const char* err = cJSON_IsString(msg) ? msg->valuestring : "unknown";
+        ESP_LOGE(TAG, "WS error: %s", err);
+        if (on_error_) {
+            on_error_(err);
+        }
         SignalSessionEnd();
     } else {
-        ESP_LOGD(TAG, "WS type=%s len=%u", type->valuestring, static_cast<unsigned>(len));
+        ESP_LOGD(TAG, "WS type=%s", t);
     }
     cJSON_Delete(root);
 }

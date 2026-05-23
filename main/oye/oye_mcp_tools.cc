@@ -22,7 +22,7 @@ void McpServer::AddOyeCloudTools() {
                     [](const PropertyList&) -> ReturnValue {
                         oye::UserInfo user;
                         if (oye::GetCurrentUser(user) != ESP_OK) {
-                            throw std::runtime_error("GET /users/me failed");
+                            throw std::runtime_error("GET /mcu/me failed");
                         }
                         cJSON* root = cJSON_CreateObject();
                         cJSON_AddNumberToObject(root, "id", user.id);

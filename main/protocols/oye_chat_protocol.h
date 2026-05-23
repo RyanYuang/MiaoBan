@@ -6,17 +6,18 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <string>
 
 namespace oye {
-class MeetingStream;
+class VoiceChatStream;
 }
 
 /**
- * Oye cloud voice dialog: meeting WS ASR + POST /chats/.../messages.
- * Replaces MQTT/WebSocket Opus streaming when CONFIG_USE_OYE_CLOUD_API is enabled.
+ * Oye cloud voice dialog: WS /mcu/voice-chat/ws (binary PCM uplink, embedded ASR+LLM+TTS).
+ * Sole voice protocol when CONFIG_USE_OYE_CLOUD_API is enabled (Xiaozhi MQTT/WS not built).
  */
 class OyeChatProtocol : public Protocol {
 public:
@@ -32,6 +33,7 @@ public:
     bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) override;
     void SendStartListening(ListeningMode mode) override;
     void SendStopListening() override;
+    void SendAbortSpeaking(AbortReason reason) override;
 
 protected:
     bool SendText(const std::string& text) override;
@@ -40,10 +42,14 @@ private:
     std::function<void(std::function<void()>)> schedule_;
     bool channel_open_ = false;
     int chat_session_id_ = 0;
-    oye::MeetingStream* meeting_stream_ = nullptr;
+    oye::VoiceChatStream* voice_chat_stream_ = nullptr;
     TaskHandle_t worker_ = nullptr;
     std::mutex worker_mutex_;
     bool processing_ = false;
+    std::atomic<bool> speak_abort_{false};
+    std::atomic<bool> pcm_tap_first_feed_logged_{false};
+    bool user_check_ok_ = false;
+    int64_t user_check_time_us_ = 0;
 
     void EmitJson(const char* type, const std::string& text, const char* state = nullptr);
     void ProcessUtteranceTask(void* arg);

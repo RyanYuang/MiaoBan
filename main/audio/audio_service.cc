@@ -105,7 +105,10 @@ void AudioService::Initialize(AudioCodec* codec) {
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
         if (pcm_tap_) {
+            // Oye meeting WS uplinks raw PCM; skip Opus encode queue (MAX_ENCODE_TASKS_IN_QUEUE=2
+            // would block this callback after two frames and starve further mic uplink).
             pcm_tap_(data);
+            return;
         }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
@@ -670,6 +673,40 @@ void AudioService::EnableDeviceAec(bool enable) {
 
 void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
     callbacks_ = callbacks;
+}
+
+void AudioService::PlayPcm(const std::vector<int16_t>& pcm, int sample_rate) {
+    if (pcm.empty() || codec_ == nullptr) {
+        return;
+    }
+    ESP_LOGD(TAG, "PlayPcm: %u samples @ %d Hz -> output %d Hz", static_cast<unsigned>(pcm.size()),
+             sample_rate, codec_->output_sample_rate());
+    std::vector<int16_t> out = pcm;
+    if (sample_rate > 0 && sample_rate != codec_->output_sample_rate()) {
+        ESP_LOGD(TAG, "PlayPcm: resampling %d -> %d", sample_rate, codec_->output_sample_rate());
+        esp_ae_rate_cvt_handle_t resampler = nullptr;
+        esp_ae_rate_cvt_cfg_t cfg = RATE_CVT_CFG(sample_rate, codec_->output_sample_rate(), ESP_AUDIO_MONO);
+        if (esp_ae_rate_cvt_open(&cfg, &resampler) == ESP_AE_ERR_OK && resampler != nullptr) {
+            uint32_t max_out = 0;
+            esp_ae_rate_cvt_get_max_out_sample_num(resampler, out.size(), &max_out);
+            std::vector<int16_t> resampled(max_out);
+            uint32_t actual = max_out;
+            esp_ae_rate_cvt_process(resampler, reinterpret_cast<esp_ae_sample_t>(out.data()), out.size(),
+                                    reinterpret_cast<esp_ae_sample_t>(resampled.data()), &actual);
+            resampled.resize(actual);
+            out = std::move(resampled);
+            esp_ae_rate_cvt_close(resampler);
+        }
+    }
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm = std::move(out);
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        audio_playback_queue_.push_back(std::move(task));
+    }
+    audio_queue_cv_.notify_all();
 }
 
 void AudioService::PlaySound(const std::string_view& ogg) {

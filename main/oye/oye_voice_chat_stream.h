@@ -1,5 +1,5 @@
-#ifndef OYE_MEETING_STREAM_H
-#define OYE_MEETING_STREAM_H
+#ifndef OYE_VOICE_CHAT_STREAM_H
+#define OYE_VOICE_CHAT_STREAM_H
 
 class WebSocket;
 
@@ -7,6 +7,7 @@ class WebSocket;
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -14,27 +15,31 @@ class WebSocket;
 
 namespace oye {
 
-/** Meeting minutes ASR: PCM 16k mono s16le → WS /mcu/meetings/stream/ws (backend relay). */
-class MeetingStream {
+/** Voice assistant: PCM → WS /mcu/voice-chat/ws → ASR + LLM + TTS (binary PCM uplink). */
+class VoiceChatStream {
 public:
     using TextCallback = std::function<void(const std::string& text)>;
-    using DoneCallback = std::function<void(const std::string& text, int meeting_id)>;
+    using DoneCallback =
+        std::function<void(const std::string& user_text, const std::string& assistant_text, int chat_session_id)>;
+    using ErrorCallback = std::function<void(const std::string& message)>;
 
-    MeetingStream();
-    ~MeetingStream();
+    VoiceChatStream();
+    ~VoiceChatStream();
 
-    bool Start(const std::string& title, bool save_meeting, TextCallback on_asr, DoneCallback on_done);
+    bool Start(int chat_session_id, TextCallback on_asr, TextCallback on_asr_final, TextCallback on_llm_text,
+               std::function<void(const char* state)> on_tts_state, DoneCallback on_done,
+               ErrorCallback on_error);
     void FeedPcm(const int16_t* samples, size_t count);
-    /** @param wait_for_done 为 true 时在后台会话里等待 type=done；主线程应传 false。 */
     void Stop(bool wait_for_done = true);
     bool IsRunning() const { return running_; }
-    std::string LatestText() const;
 
 private:
-    static constexpr TickType_t kDoneWaitTicks = pdMS_TO_TICKS(15000);
-    static constexpr size_t kPcmFrameSamples = 960;  // 60ms @ 16kHz
+    static constexpr TickType_t kDoneWaitTicks = pdMS_TO_TICKS(120000);
+    static constexpr size_t kPcmFrameSamples = 960;
     static constexpr size_t kPcmFrameBytes = kPcmFrameSamples * sizeof(int16_t);
     static constexpr UBaseType_t kPcmQueueDepth = 6;
+    /** Max samples held in pcm_accum_ (~8 frames); excess drops oldest first. */
+    static constexpr size_t kPcmAccumMaxSamples = kPcmFrameSamples * (kPcmQueueDepth + 2);
 
     static constexpr EventBits_t kDoneReceivedBit = BIT0;
     static constexpr EventBits_t kSendTaskExitBit = BIT1;
@@ -43,15 +48,21 @@ private:
     bool stream_ready_ = false;
     bool session_finished_ = false;
     bool transport_boost_ = false;
-    bool save_meeting_ = false;
     volatile bool send_task_run_ = false;
     uint32_t pcm_feed_count_ = 0;
     uint32_t pcm_bytes_sent_ = 0;
     uint32_t pcm_queue_drops_ = 0;
-    std::string latest_text_;
+    uint32_t pcm_accum_trims_ = 0;
+    int next_tts_seq_ = 0;
+    std::string user_text_;
+    std::string assistant_text_;
     mutable std::mutex mutex_;
     TextCallback on_asr_;
+    TextCallback on_asr_final_;
+    TextCallback on_llm_text_;
+    std::function<void(const char* state)> on_tts_state_;
     DoneCallback on_done_;
+    ErrorCallback on_error_;
     WebSocket* websocket_ = nullptr;
     EventGroupHandle_t done_event_ = nullptr;
     QueueHandle_t pcm_queue_ = nullptr;
@@ -61,9 +72,11 @@ private:
     StackType_t* send_task_stack_ = nullptr;
     StaticTask_t* send_task_tcb_ = nullptr;
     int16_t send_frame_[kPcmFrameSamples];
+    std::vector<int16_t> pcm_accum_;
 
-    static std::string BuildWsUrl();
     static void SendTaskEntry(void* arg);
+    void TrimPcmAccumIfNeeded();
+    void FlushPcmAccumToQueue();
     void HandleText(const char* data, size_t len);
     bool SendPcmChunk(const int16_t* samples, size_t count);
     void SignalSessionEnd();

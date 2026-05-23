@@ -51,9 +51,9 @@ bool BuildWavFromPcm(const std::vector<int16_t>& pcm, std::vector<uint8_t>& wav_
 }
 
 esp_err_t GetCurrentUser(UserInfo& out) {
-    auto res = RequestJson("GET", "/users/me");
+    auto res = RequestJson("GET", "/me");
     if (!res.Ok()) {
-        ESP_LOGE(TAG, "GET /users/me failed code=%d %s", res.code, res.message.c_str());
+        ESP_LOGE(TAG, "GET /me failed code=%d %s", res.code, res.message.c_str());
         return ESP_FAIL;
     }
     if (res.data == nullptr) {
@@ -99,6 +99,15 @@ esp_err_t EnsureChatSession(int& session_id) {
 }
 
 esp_err_t SendChatMessage(int session_id, const std::string& user_text, ChatMessageResult& out) {
+    ESP_LOGI(TAG, "SendChatMessage session=%d user_len=%u", session_id,
+             static_cast<unsigned>(user_text.size()));
+    if (user_text.size() <= 160) {
+        ESP_LOGI(TAG, "  user: %s", user_text.c_str());
+    } else {
+        ESP_LOGI(TAG, "  user: %.160s… (%u chars)", user_text.c_str(),
+                 static_cast<unsigned>(user_text.size()));
+    }
+
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "role", "user");
     cJSON_AddStringToObject(root, "content", user_text.c_str());
@@ -109,6 +118,8 @@ esp_err_t SendChatMessage(int session_id, const std::string& user_text, ChatMess
 
     std::string path = "/chats/sessions/" + std::to_string(session_id) + "/messages";
     auto res = RequestJson("POST", path.c_str(), body);
+    ESP_LOGI(TAG, "SendChatMessage response http=%d biz_code=%d msg=%s", res.http_status, res.code,
+             res.message.c_str());
     if (!res.Ok() || res.data == nullptr) {
         ESP_LOGE(TAG, "send message failed code=%d %s", res.code, res.message.c_str());
         return ESP_FAIL;
@@ -121,14 +132,33 @@ esp_err_t SendChatMessage(int session_id, const std::string& user_text, ChatMess
         if (cJSON_IsString(content)) {
             out.user_text = content->valuestring;
         }
+        auto uid = cJSON_GetObjectItem(user_msg, "id");
+        if (cJSON_IsNumber(uid)) {
+            ESP_LOGI(TAG, "  user_message id=%d", uid->valueint);
+        }
     }
     if (cJSON_IsObject(assistant_msg)) {
         auto content = cJSON_GetObjectItem(assistant_msg, "content");
         if (cJSON_IsString(content)) {
             out.assistant_text = content->valuestring;
         }
+        auto aid = cJSON_GetObjectItem(assistant_msg, "id");
+        if (cJSON_IsNumber(aid)) {
+            ESP_LOGI(TAG, "  assistant_message id=%d len=%u", aid->valueint,
+                     static_cast<unsigned>(out.assistant_text.size()));
+        }
     }
-    return out.assistant_text.empty() ? ESP_FAIL : ESP_OK;
+    if (out.assistant_text.empty()) {
+        ESP_LOGE(TAG, "SendChatMessage: empty assistant_text");
+        return ESP_FAIL;
+    }
+    if (out.assistant_text.size() <= 160) {
+        ESP_LOGI(TAG, "  assistant: %s", out.assistant_text.c_str());
+    } else {
+        ESP_LOGI(TAG, "  assistant: %.160s… (%u chars)", out.assistant_text.c_str(),
+                 static_cast<unsigned>(out.assistant_text.size()));
+    }
+    return ESP_OK;
 }
 
 static esp_err_t ParseMeeting(const cJSON* data, MeetingInfo& out) {
@@ -169,7 +199,7 @@ static esp_err_t ParseMeeting(const cJSON* data, MeetingInfo& out) {
 
 esp_err_t UploadMeetingAudio(const uint8_t* wav_data, size_t wav_size, const std::string& title,
                              int& meeting_id) {
-    ESP_LOGI(TAG, "POST /meetings/upload title=%s wav_bytes=%u", title.c_str(),
+    ESP_LOGI(TAG, "POST /mcu/meetings/upload title=%s wav_bytes=%u", title.c_str(),
              static_cast<unsigned>(wav_size));
     auto res = RequestMultipart("/meetings/upload", "audio", "meet.wav", "audio/wav", wav_data,
                                 wav_size, "title", title);
@@ -315,7 +345,7 @@ esp_err_t PollMeetingUntilDone(int meeting_id, MeetingInfo& out, int timeout_sec
 }
 
 esp_err_t RegisterMyVoiceprint(const uint8_t* wav_data, size_t wav_size) {
-    auto res = RequestMultipart("/meetings/voiceprint/me/register", "audio", "voice.wav", "audio/wav",
+    auto res = RequestMultipart("/voiceprint/me/register", "audio", "voice.wav", "audio/wav",
                                 wav_data, wav_size);
     if (!res.Ok()) {
         ESP_LOGE(TAG, "voiceprint register failed code=%d", res.code);
@@ -325,7 +355,7 @@ esp_err_t RegisterMyVoiceprint(const uint8_t* wav_data, size_t wav_size) {
 }
 
 esp_err_t VerifyMyVoiceprint(const uint8_t* wav_data, size_t wav_size, VoiceprintVerifyResult& out) {
-    auto res = RequestMultipart("/meetings/voiceprint/me/verify", "audio", "voice.wav", "audio/wav",
+    auto res = RequestMultipart("/voiceprint/me/verify", "audio", "voice.wav", "audio/wav",
                                 wav_data, wav_size);
     if (!res.Ok() || res.data == nullptr) {
         return ESP_FAIL;

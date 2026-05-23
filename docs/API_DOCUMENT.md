@@ -1063,6 +1063,85 @@ pending → submitting → transcribing → summarizing → done
 - 结束：`{"type":"done","text":"...","meeting_id":123}`（若未落库则 `meeting_id` 为 `null`）
 - 错误：`{"type":"error","message":"..."}`
 
+#### 5.8.9 提交已有转写文本
+
+- 方法与路径：`POST /api/v1/meetings/stream/transcript`
+- 鉴权：是
+- Content-Type：`application/json`
+
+请求体：
+
+```json
+{
+  "title": "实时会议",
+  "transcript_text": "大家早上好……",
+  "group_id": null
+}
+```
+
+成功响应（201）：`data` 为 `MeetingResponse`，`status` 进入摘要流程；客户端轮询 `GET /meetings/{id}` 直至 `done`。
+
+#### 5.8.10 获取讯飞 RTASR 签名 URL
+
+- 方法与路径：`GET /api/v1/meetings/stream/xfyun-ws-url`
+- 鉴权：是
+
+响应 `data`：
+
+```json
+{ "ws_url": "wss://office-api-ast-dx.iflyaisol.com/ast/communicate/v1?..." }
+```
+
+客户端（含 MCU）可直连讯飞 WebSocket 推音频；识别结束后将文本提交 §5.8.9 或用于对话。
+
+#### 5.8.11 声纹管理
+
+后端代理讯飞声纹识别（新）API。音频要求：**16kHz / 16bit / 单声道 WAV**，建议 **3~5 秒**。
+
+| 方法与路径 | 说明 |
+|------------|------|
+| `POST /api/v1/meetings/voiceprint/groups` | 创建特征库 `{"group_name","group_desc?"}` |
+| `DELETE /api/v1/meetings/voiceprint/groups/{group_id}` | 删除特征库 |
+| `POST /api/v1/meetings/voiceprint/me/register` | 注册当前用户声纹（`multipart` 字段 `audio`） |
+| `POST /api/v1/meetings/voiceprint/me/verify` | 校验当前用户声纹（同上） |
+
+注册响应 `data`：`group_id`、`feature_id`（形如 `u_{user_id}`）、`request_id`。
+
+校验响应 `data`：`matched`、`score`、`threshold`（默认约 `0.75`）、`request_id`。
+
+环境变量：`XFYUN_VOICEPRINT_USER_GROUP_ID`（默认 `oye_voiceprints`）、`XFYUN_VOICEPRINT_SCORE_THRESHOLD`。
+
+### 5.9 语音合成（TTS）
+
+后端代理火山引擎豆包语音合成 V3（[文档](https://www.volcengine.com/docs/6561/1598757)）。
+
+#### 5.9.1 流式合成
+
+- 方法与路径：`POST /api/v1/tts/stream`
+- 鉴权：是
+- Content-Type：`application/json`
+- 响应：`text/event-stream`（SSE）
+
+请求体：
+
+```json
+{ "text": "待朗读的文本" }
+```
+
+| 字段 | 说明 |
+|------|------|
+| `text` | 1~4000 字符；服务端去 Markdown 并截断至 `VOLCENGINE_TTS_MAX_TEXT_LENGTH`（默认 2000） |
+
+SSE 事件（每行 `data: {...}`）：
+
+| `type` | 说明 |
+|--------|------|
+| `chunk` | `data` 为 Base64 MP3 分片；`format` 为 `mp3` |
+| `done` | 合成结束 |
+| `error` | `message` 为错误说明 |
+
+服务端环境变量：`VOLCENGINE_TTS_API_KEY`、`VOLCENGINE_TTS_RESOURCE_ID`（默认 `seed-tts-2.0`）、`VOLCENGINE_TTS_SPEAKER`、`VOLCENGINE_TTS_FORMAT`、`VOLCENGINE_TTS_SAMPLE_RATE` 等，见 `Backend/backend/.env.example`。
+
 ## 6. 联调建议
 
 - 先调登录接口拿到 token，再串行联调其他业务接口
@@ -1070,3 +1149,4 @@ pending → submitting → transcribing → summarizing → done
 - 业务报错优先根据 `code` 分支处理，再显示 `message`
 - 会议纪要：**整段录音**上传后通过 `GET /meetings/{id}` 轮询 `status` 直至 `done` / `failed`；轮询频率建议 2～5 秒
 - 会议纪要：**流式**识别结束后若 `save_meeting=true`，同样用返回的 `meeting_id` 轮询详情直至摘要完成
+- TTS：`POST /tts/stream` 按 SSE 拼接 Base64 MP3；设备端详见 [oye-mcu-http-api_zh.md](./oye-mcu-http-api_zh.md) §9

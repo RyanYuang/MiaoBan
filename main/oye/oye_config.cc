@@ -46,6 +46,26 @@ bool HasAccessToken() {
     return !GetAccessTokenRaw().empty();
 }
 
+std::string BuildWebSocketUrl(const std::string& resource_path) {
+    std::string base = GetApiBaseUrl();
+    while (!base.empty() && base.back() == '/') {
+        base.pop_back();
+    }
+    std::string ws_base;
+    if (base.rfind("https://", 0) == 0) {
+        ws_base = "wss://" + base.substr(8);
+    } else if (base.rfind("http://", 0) == 0) {
+        ws_base = "ws://" + base.substr(7);
+    } else {
+        ws_base = "ws://" + base;
+    }
+    std::string path = resource_path;
+    if (path.empty() || path.front() != '/') {
+        path = "/" + path;
+    }
+    return ws_base + std::string(kApiPrefix) + path + "?token=" + GetAccessTokenRaw();
+}
+
 bool IsOyeCloudEnabled() {
 #ifdef CONFIG_USE_OYE_CLOUD_API
     return true;
