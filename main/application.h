@@ -10,6 +10,8 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
+#include <cstdint>
 
 #include "protocol.h"
 #include "ota.h"
@@ -31,12 +33,24 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+#define MAIN_EVENT_SPEECH_END_DETECTED  (1 << 13)
 
 
 enum AecMode {
     kAecOff,
     kAecOnDeviceSide,
     kAecOnServerSide,
+};
+
+enum class SpeechEndTimerReason : uint8_t {
+    kNone,
+    kSilence,
+    kNoSpeech,
+};
+
+enum class SpeechActivitySource : uint8_t {
+    kAfeVad,
+    kPcmLevel,
 };
 
 class Application {
@@ -88,6 +102,9 @@ public:
     void DismissAlert();
 
     void AbortSpeaking(AbortReason reason);
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    void ObserveUplinkPcmForSpeechEnd(const int16_t* samples, size_t count);
+#endif
 
     /**
      * Toggle chat state (event-based, thread-safe)
@@ -133,6 +150,7 @@ private:
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    esp_timer_handle_t speech_end_timer_handle_ = nullptr;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -146,6 +164,13 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    std::atomic<bool> afe_vad_speaking_{false};
+    std::atomic<bool> pcm_level_speaking_{false};
+    std::atomic<bool> speech_activity_speaking_{false};
+    std::atomic<bool> speech_activity_seen_{false};
+    bool speech_started_ = false;
+    bool speech_end_waiting_ = false;
+    SpeechEndTimerReason speech_end_timer_reason_ = SpeechEndTimerReason::kNone;
 
 
     // Event handlers
@@ -161,6 +186,8 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    void HandleVadChangeEvent();
+    void HandleSpeechEndDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
 
@@ -174,6 +201,10 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
+    void BeginSpeechEndDetection();
+    void ResetSpeechEndDetection();
+    void ArmSpeechEndTimer(SpeechEndTimerReason reason, uint32_t timeout_ms);
+    void UpdateSpeechActivity(SpeechActivitySource source, bool speaking);
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);

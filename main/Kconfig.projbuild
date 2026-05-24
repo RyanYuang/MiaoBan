@@ -55,6 +55,41 @@ menu "Oye diagnostics"
         depends on OYE_AUTO_VOICE_TEST
         default 8000
         range 1000 60000
+
+    config OYE_SPEECH_END_DETECTION
+        bool "Enable Oye speech end detection"
+        depends on USE_OYE_CLOUD_API
+        default y
+        help
+            Use the local VAD signal to automatically stop Oye voice-chat
+            listening after the user has spoken and then stayed silent.
+
+    config OYE_SPEECH_END_SILENCE_MS
+        int "Oye speech-end silence duration (ms)"
+        depends on OYE_SPEECH_END_DETECTION
+        default 1200
+        range 300 5000
+        help
+            Continuous non-speech duration required before sending
+            StopListening to the Oye voice-chat WebSocket.
+
+    config OYE_SPEECH_END_PCM_LEVEL_THRESHOLD
+        int "Oye speech-end PCM level threshold"
+        depends on OYE_SPEECH_END_DETECTION
+        default 50
+        range 50 5000
+        help
+            Mean absolute amplitude threshold used as a fallback speech
+            activity signal on the PCM frames uploaded to Oye ASR.
+
+    config OYE_SPEECH_END_NO_SPEECH_TIMEOUT_MS
+        int "Oye no-speech timeout (ms)"
+        depends on OYE_SPEECH_END_DETECTION
+        default 10000
+        range 0 60000
+        help
+            Maximum listening time before auto-stopping when no speech is
+            detected. Set to 0 to disable this timeout.
 endmenu
 
 choice

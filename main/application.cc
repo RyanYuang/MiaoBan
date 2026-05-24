@@ -151,6 +151,18 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    esp_timer_create_args_t speech_end_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_SPEECH_END_DETECTED);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "speech_end",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&speech_end_timer_args, &speech_end_timer_handle_);
 }
 
 /**
@@ -160,6 +172,10 @@ Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (speech_end_timer_handle_ != nullptr) {
+        esp_timer_stop(speech_end_timer_handle_);
+        esp_timer_delete(speech_end_timer_handle_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -217,7 +233,7 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
-        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+        UpdateSpeechActivity(SpeechActivitySource::kAfeVad, speaking);
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -332,7 +348,8 @@ void Application::Run() {
         MAIN_EVENT_START_LISTENING |      // 主动开始监听
         MAIN_EVENT_STOP_LISTENING |       // 主动停止监听
         MAIN_EVENT_ACTIVATION_DONE |      // 激活流程完成
-        MAIN_EVENT_STATE_CHANGED;         // 状态机状态变化
+        MAIN_EVENT_STATE_CHANGED |        // 状态机状态变化
+        MAIN_EVENT_SPEECH_END_DETECTED;   // 本地端点检测确认说话结束
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -394,11 +411,11 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
-            // 监听态下 VAD 变化主要用于驱动灯效反馈。
-            if (GetDeviceState() == kDeviceStateListening) {
-                auto led = Board::GetInstance().GetLed();
-                led->OnStateChanged();
-            }
+            HandleVadChangeEvent();
+        }
+
+        if (bits & MAIN_EVENT_SPEECH_END_DETECTED) {
+            HandleSpeechEndDetectedEvent();
         }
 
         if (bits & MAIN_EVENT_SCHEDULE) {
@@ -1004,7 +1021,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 /**
- * 主循环处理「开始监听」：与 Toggle 类似，但固定使用手动停止聆听模式。
+ * 主循环处理「开始监听」：与 Toggle 类似，并按当前协议/AEC 选择默认聆听模式。
  */
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
@@ -1022,20 +1039,25 @@ void Application::HandleStartListeningEvent() {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
     }
+
+    ListeningMode mode = kListeningModeManualStop;
+#if CONFIG_USE_OYE_CLOUD_API
+    mode = GetDefaultListeningMode();
+#endif
     
     if (state == kDeviceStateIdle) {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this]() {
-                ContinueOpenAudioChannel(kListeningModeManualStop);
+            Schedule([this, mode]() {
+                ContinueOpenAudioChannel(mode);
             });
             return;
         }
-        SetListeningMode(kListeningModeManualStop);
+        SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
-        SetListeningMode(kListeningModeManualStop);
+        SetListeningMode(mode);
     }
 }
 
@@ -1160,6 +1182,10 @@ void Application::HandleStateChangedEvent() {
     // BLE 配网与云语音链路争用内部内存和无线共存资源；对话阶段优先让给 Wi-Fi/WS。
     SyncOyeBleProvisioning(new_state);
 #endif
+
+    if (new_state != kDeviceStateListening) {
+        ResetSpeechEndDetection();
+    }
     
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -1201,6 +1227,7 @@ void Application::HandleStateChangedEvent() {
                 play_popup_on_listening_ = false;
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             }
+            BeginSpeechEndDetection();
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1223,6 +1250,212 @@ void Application::HandleStateChangedEvent() {
             // 无操作
             break;
     }
+}
+
+void Application::ArmSpeechEndTimer(SpeechEndTimerReason reason, uint32_t timeout_ms) {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    if (speech_end_timer_handle_ == nullptr || timeout_ms == 0) {
+        return;
+    }
+
+    (void)esp_timer_stop(speech_end_timer_handle_);
+    speech_end_timer_reason_ = reason;
+    esp_err_t err = esp_timer_start_once(speech_end_timer_handle_,
+                                         static_cast<uint64_t>(timeout_ms) * 1000ULL);
+    if (err != ESP_OK) {
+        speech_end_timer_reason_ = SpeechEndTimerReason::kNone;
+        ESP_LOGW(TAG, "Speech end timer start failed: %d", static_cast<int>(err));
+    }
+#else
+    (void)reason;
+    (void)timeout_ms;
+#endif
+}
+
+void Application::BeginSpeechEndDetection() {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    if (listening_mode_ != kListeningModeAutoStop) {
+        return;
+    }
+
+    speech_started_ = false;
+    speech_end_waiting_ = false;
+    speech_end_timer_reason_ = SpeechEndTimerReason::kNone;
+    speech_activity_seen_.store(false);
+    afe_vad_speaking_.store(audio_service_.IsVoiceDetected());
+    pcm_level_speaking_.store(false);
+    speech_activity_speaking_.store(afe_vad_speaking_.load());
+
+    ESP_LOGI(TAG, "Speech end detection armed: silence=%dms pcm_level=%d no_speech=%dms",
+             CONFIG_OYE_SPEECH_END_SILENCE_MS,
+             CONFIG_OYE_SPEECH_END_PCM_LEVEL_THRESHOLD,
+             CONFIG_OYE_SPEECH_END_NO_SPEECH_TIMEOUT_MS);
+
+    if (speech_activity_speaking_.load()) {
+        speech_started_ = true;
+        ESP_LOGI(TAG, "Speech end detection: initial VAD speaking");
+        return;
+    }
+
+#if CONFIG_OYE_SPEECH_END_NO_SPEECH_TIMEOUT_MS > 0
+    ArmSpeechEndTimer(SpeechEndTimerReason::kNoSpeech, CONFIG_OYE_SPEECH_END_NO_SPEECH_TIMEOUT_MS);
+#endif
+#endif
+}
+
+void Application::ResetSpeechEndDetection() {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    if (speech_end_timer_handle_ != nullptr) {
+        (void)esp_timer_stop(speech_end_timer_handle_);
+    }
+    speech_started_ = false;
+    speech_end_waiting_ = false;
+    speech_end_timer_reason_ = SpeechEndTimerReason::kNone;
+    speech_activity_seen_.store(false);
+    afe_vad_speaking_.store(false);
+    pcm_level_speaking_.store(false);
+    speech_activity_speaking_.store(false);
+#endif
+}
+
+void Application::UpdateSpeechActivity(SpeechActivitySource source, bool speaking) {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    std::atomic<bool>* source_state = nullptr;
+    const char* source_name = "";
+    if (source == SpeechActivitySource::kAfeVad) {
+        source_state = &afe_vad_speaking_;
+        source_name = "AFE VAD";
+    } else {
+        source_state = &pcm_level_speaking_;
+        source_name = "PCM level";
+    }
+
+    const bool source_previous = source_state->exchange(speaking);
+    if (source_previous == speaking) {
+        if (speaking) {
+            speech_activity_seen_.store(true);
+        }
+        return;
+    }
+
+    const bool aggregate = afe_vad_speaking_.load() || pcm_level_speaking_.load();
+    const bool previous = speech_activity_speaking_.exchange(aggregate);
+    if (aggregate) {
+        speech_activity_seen_.store(true);
+    }
+
+    ESP_LOGI(TAG, "Speech end detection: %s %s aggregate=%d",
+             source_name, speaking ? "speaking" : "silent", aggregate ? 1 : 0);
+
+    if (aggregate != previous || aggregate) {
+        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+    }
+#else
+    (void)source;
+    (void)speaking;
+#endif
+}
+
+#if CONFIG_OYE_SPEECH_END_DETECTION
+void Application::ObserveUplinkPcmForSpeechEnd(const int16_t* samples, size_t count) {
+    if (GetDeviceState() != kDeviceStateListening || listening_mode_ != kListeningModeAutoStop ||
+        samples == nullptr || count == 0) {
+        return;
+    }
+
+    uint64_t sum_abs = 0;
+    for (size_t i = 0; i < count; ++i) {
+        int32_t sample = samples[i];
+        if (sample < 0) {
+            sample = -sample;
+        }
+        sum_abs += static_cast<uint32_t>(sample);
+    }
+
+    const uint32_t level = static_cast<uint32_t>(sum_abs / count);
+    const bool speaking = level >= CONFIG_OYE_SPEECH_END_PCM_LEVEL_THRESHOLD;
+    if (speaking != pcm_level_speaking_.load()) {
+        ESP_LOGI(TAG, "Speech end detection: PCM level=%u threshold=%d -> %s",
+                 static_cast<unsigned>(level),
+                 CONFIG_OYE_SPEECH_END_PCM_LEVEL_THRESHOLD,
+                 speaking ? "speaking" : "silent");
+    }
+    UpdateSpeechActivity(SpeechActivitySource::kPcmLevel, speaking);
+}
+#endif
+
+void Application::HandleVadChangeEvent() {
+    if (GetDeviceState() == kDeviceStateListening) {
+        auto led = Board::GetInstance().GetLed();
+        led->OnStateChanged();
+    }
+
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    if (GetDeviceState() != kDeviceStateListening || listening_mode_ != kListeningModeAutoStop) {
+        return;
+    }
+
+    const bool speaking = speech_activity_speaking_.load();
+    const bool speech_seen = speech_activity_seen_.exchange(false);
+    if (speaking || speech_seen) {
+        if (!speech_started_) {
+            ESP_LOGI(TAG, "Speech end detection: speech started");
+        }
+        speech_started_ = true;
+        if (speaking) {
+            if (speech_end_timer_handle_ != nullptr) {
+                (void)esp_timer_stop(speech_end_timer_handle_);
+            }
+            speech_end_waiting_ = false;
+            speech_end_timer_reason_ = SpeechEndTimerReason::kNone;
+            return;
+        }
+    }
+
+    if (!speaking && speech_started_ && !speech_end_waiting_) {
+        speech_end_waiting_ = true;
+        ESP_LOGI(TAG, "Speech end detection: silence started, wait %dms",
+                 CONFIG_OYE_SPEECH_END_SILENCE_MS);
+        ArmSpeechEndTimer(SpeechEndTimerReason::kSilence, CONFIG_OYE_SPEECH_END_SILENCE_MS);
+    }
+#endif
+}
+
+void Application::HandleSpeechEndDetectedEvent() {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    const SpeechEndTimerReason reason = speech_end_timer_reason_;
+    speech_end_timer_reason_ = SpeechEndTimerReason::kNone;
+
+    if (GetDeviceState() != kDeviceStateListening || listening_mode_ != kListeningModeAutoStop) {
+        return;
+    }
+
+    if (speech_activity_speaking_.load()) {
+        ESP_LOGI(TAG, "Speech end detection: timer ignored, speech activity is active");
+        speech_end_waiting_ = false;
+        return;
+    }
+
+    if (reason == SpeechEndTimerReason::kSilence) {
+        if (!speech_started_ || !speech_end_waiting_) {
+            return;
+        }
+        ESP_LOGI(TAG, "Speech end detection: speech ended, auto StopListening");
+    } else if (reason == SpeechEndTimerReason::kNoSpeech) {
+        if (speech_started_) {
+            return;
+        }
+        ESP_LOGI(TAG, "Speech end detection: no speech timeout, auto StopListening");
+    } else {
+        return;
+    }
+
+    speech_end_waiting_ = false;
+    if (protocol_) {
+        protocol_->SendStopListening();
+    }
+    SetDeviceState(kDeviceStateIdle);
+#endif
 }
 
 /**
@@ -1261,7 +1494,11 @@ void Application::SetListeningMode(ListeningMode mode) {
  */
 ListeningMode Application::GetDefaultListeningMode() const {
 #if CONFIG_USE_OYE_CLOUD_API
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    return kListeningModeAutoStop;
+#else
     return kListeningModeManualStop;
+#endif
 #else
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
 #endif

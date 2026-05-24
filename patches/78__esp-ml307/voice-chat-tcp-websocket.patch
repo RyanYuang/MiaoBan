@@ -403,7 +403,7 @@
  
  bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
 +    const int64_t t_enter_us = esp_timer_get_time();
-+    ESP_LOGI(TAG, "Send enter: payload=%u binary=%d fin=%d connected=%d",
++    ESP_LOGD(TAG, "Send enter: payload=%u binary=%d fin=%d connected=%d",
 +             static_cast<unsigned>(len), binary ? 1 : 0, fin ? 1 : 0, connected_ ? 1 : 0);
 +
      if (len > 65535) {
@@ -425,7 +425,7 @@
  
 -    // 发送帧
 +    const int32_t build_us = static_cast<int32_t>(esp_timer_get_time() - t_enter_us);
-+    ESP_LOGI(TAG, "Send frame built: wire=%u opcode=0x%02x build_us=%d",
++    ESP_LOGD(TAG, "Send frame built: wire=%u opcode=0x%02x build_us=%d",
 +             static_cast<unsigned>(frame.size()), first_byte, build_us);
 +
 +    // 持锁发送；优先刷掉 Ping 触发的 Pong。tcp_->Send 带 SO_SNDTIMEO，避免无限阻塞。

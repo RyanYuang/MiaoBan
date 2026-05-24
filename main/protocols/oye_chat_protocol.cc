@@ -284,6 +284,9 @@ void OyeChatProtocol::SendStartListening(ListeningMode mode) {
             ESP_LOGI(TAG, "[voice-chat] [7/8] first PCM tap feed samples=%u",
                      static_cast<unsigned>(pcm.size()));
         }
+#if CONFIG_OYE_SPEECH_END_DETECTION
+        Application::GetInstance().ObserveUplinkPcmForSpeechEnd(pcm.data(), pcm.size());
+#endif
         voice_chat_stream_->FeedPcm(pcm.data(), pcm.size());
     });
 
