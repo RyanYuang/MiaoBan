@@ -34,6 +34,93 @@
 
 namespace {
 constexpr char TAG[] = "Application";
+
+#if CONFIG_OYE_SERIAL_TEST_TRIGGER
+void SerialTestTriggerTask(void*) {
+    ESP_LOGI(TAG, "Serial test trigger ready: v=start voice, s=stop, t=toggle");
+    while (true) {
+        int ch = getchar();
+        if (ch == EOF) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        switch (ch) {
+            case 'v':
+            case 'V':
+                ESP_LOGI(TAG, "Serial trigger: StartListening");
+                Application::GetInstance().StartListening();
+                break;
+            case 's':
+            case 'S':
+                ESP_LOGI(TAG, "Serial trigger: StopListening");
+                Application::GetInstance().StopListening();
+                break;
+            case 't':
+            case 'T':
+                ESP_LOGI(TAG, "Serial trigger: ToggleChatState");
+                Application::GetInstance().ToggleChatState();
+                break;
+            case '\r':
+            case '\n':
+                break;
+            default:
+                ESP_LOGI(TAG, "Serial trigger commands: v=start, s=stop, t=toggle");
+                break;
+        }
+    }
+}
+#endif
+
+#if CONFIG_OYE_AUTO_VOICE_TEST
+void AutoVoiceTestTask(void*) {
+    ESP_LOGI(TAG, "Auto voice test armed: delay=%dms duration=%dms",
+             CONFIG_OYE_AUTO_VOICE_TEST_DELAY_MS,
+             CONFIG_OYE_AUTO_VOICE_TEST_DURATION_MS);
+
+    auto& app = Application::GetInstance();
+    for (int i = 0; i < 1200; ++i) {
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_OYE_AUTO_VOICE_TEST_DELAY_MS));
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                continue;
+            }
+
+            ESP_LOGI(TAG, "Auto voice test: StartListening");
+            app.StartListening();
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_OYE_AUTO_VOICE_TEST_DURATION_MS));
+            ESP_LOGI(TAG, "Auto voice test: StopListening");
+            app.StopListening();
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    vTaskDelete(nullptr);
+}
+#endif
+
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+void SyncOyeBleProvisioning(DeviceState state) {
+    auto& ble = OyeBleService::GetInstance();
+    if (state == kDeviceStateWifiConfiguring) {
+        if (!ble.IsRunning()) {
+            ESP_LOGI(TAG, "Starting Oye BLE provisioning for state=%d", static_cast<int>(state));
+            if (ble.Start() != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to start Oye BLE provisioning");
+            }
+        }
+        return;
+    }
+
+    if (state != kDeviceStateIdle && ble.IsRunning()) {
+        ESP_LOGI(TAG, "Stopping Oye BLE provisioning for state=%d", static_cast<int>(state));
+        if (ble.Stop() != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to stop Oye BLE provisioning");
+        }
+    }
+}
+#endif
 }
 
 /**
@@ -141,6 +228,18 @@ void Application::Initialize() {
 
     // 启动 1Hz 周期定时器，用于状态栏刷新与周期调试输出
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
+
+#if CONFIG_OYE_SERIAL_TEST_TRIGGER
+    if (xTaskCreate(SerialTestTriggerTask, "serial_test", 2048, nullptr, 3, nullptr) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to start serial test trigger task");
+    }
+#endif
+
+#if CONFIG_OYE_AUTO_VOICE_TEST
+    if (xTaskCreate(AutoVoiceTestTask, "auto_voice_test", 1536, nullptr, 3, nullptr) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to start auto voice test task");
+    }
+#endif
 
     // 注册 MCP 内置与用户工具（仅初始化阶段执行一次）
     auto& mcp_server = McpServer::GetInstance();
@@ -1056,6 +1155,11 @@ void Application::HandleStateChangedEvent() {
     auto led = board.GetLed();
     // LED 灯效随状态变化（如呼吸灯与常亮）。
     led->OnStateChanged();
+
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+    // BLE 配网与云语音链路争用内部内存和无线共存资源；对话阶段优先让给 Wi-Fi/WS。
+    SyncOyeBleProvisioning(new_state);
+#endif
     
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -1361,4 +1465,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

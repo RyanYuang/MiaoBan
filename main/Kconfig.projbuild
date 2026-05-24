@@ -24,6 +24,39 @@ menu "UI command dispatcher"
         range 1 24
 endmenu
 
+menu "Oye diagnostics"
+    config OYE_SERIAL_TEST_TRIGGER
+        bool "Enable serial voice-chat test trigger"
+        depends on USE_OYE_CLOUD_API
+        default n
+        help
+            Enable a tiny serial test hook for bench debugging.
+            Send 'v' on the console to start voice-chat listening, 's' to stop,
+            or 't' to toggle chat state.
+
+    config OYE_AUTO_VOICE_TEST
+        bool "Enable one-shot automatic voice-chat test"
+        depends on USE_OYE_CLOUD_API
+        default n
+        help
+            Enable a one-shot bench test that waits for the app to become idle,
+            starts voice-chat listening, then stops it after a fixed duration.
+            This is intended for local ASR debugging when serial input cannot be
+            forwarded to the device.
+
+    config OYE_AUTO_VOICE_TEST_DELAY_MS
+        int "Automatic voice-chat test start delay (ms)"
+        depends on OYE_AUTO_VOICE_TEST
+        default 5000
+        range 1000 60000
+
+    config OYE_AUTO_VOICE_TEST_DURATION_MS
+        int "Automatic voice-chat test listening duration (ms)"
+        depends on OYE_AUTO_VOICE_TEST
+        default 8000
+        range 1000 60000
+endmenu
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

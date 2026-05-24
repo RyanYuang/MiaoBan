@@ -1,0 +1,606 @@
+--- src/esp/esp_tcp.cc	2026-05-11 16:30:47
++++ src/esp/esp_tcp.cc	2026-05-24 01:46:38
+@@ -1,15 +1,107 @@
+ #include "esp_tcp.h"
+ 
++#include <esp_heap_caps.h>
+ #include <esp_log.h>
++#include <esp_timer.h>
++#include <sdkconfig.h>
+ #include <unistd.h>
++#include <fcntl.h>
+ #include <cstring>
+ #include <arpa/inet.h>
++#include <netinet/tcp.h>
+ #include <sys/socket.h>
++#include <sys/select.h>
++#include <sys/time.h>
+ #include <netdb.h>
+ #include <errno.h>
+ 
+ static const char *TAG = "EspTcp";
+ 
++static constexpr uint32_t kTcpReceiveStackWords = 2560;
++static constexpr UBaseType_t kTcpReceiveTaskPriority = 6;
++static constexpr int kTcpConnectTimeoutMs = 10000;
++static constexpr int kTcpSendTimeoutMs = 5000;
++static void ConfigureSocket(int fd) {
++    int flag = 1;
++    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
++
++    const int sndbuf = 8192;
++    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
++
++    const int flags = fcntl(fd, F_GETFL, 0);
++    if (flags >= 0) {
++        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++    }
++}
++
++static bool WaitForNonBlockingConnect(int fd, int timeout_ms, int& error_out) {
++    fd_set write_fds;
++    FD_ZERO(&write_fds);
++    FD_SET(fd, &write_fds);
++
++    struct timeval timeout;
++    timeout.tv_sec = timeout_ms / 1000;
++    timeout.tv_usec = (timeout_ms % 1000) * 1000;
++
++    int ret = select(fd + 1, nullptr, &write_fds, nullptr, &timeout);
++    if (ret < 0) {
++        error_out = errno;
++        return false;
++    }
++    if (ret == 0) {
++        error_out = ETIMEDOUT;
++        return false;
++    }
++
++    int socket_error = 0;
++    socklen_t opt_len = sizeof(socket_error);
++    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &opt_len) < 0) {
++        error_out = errno;
++        return false;
++    }
++    if (socket_error != 0) {
++        error_out = socket_error;
++        return false;
++    }
++
++    error_out = 0;
++    return true;
++}
++
++static bool WaitForWritable(int fd, int timeout_ms, int& error_out) {
++    fd_set write_fds;
++    FD_ZERO(&write_fds);
++    FD_SET(fd, &write_fds);
++
++    struct timeval timeout;
++    timeout.tv_sec = timeout_ms / 1000;
++    timeout.tv_usec = (timeout_ms % 1000) * 1000;
++
++    int ret = select(fd + 1, nullptr, &write_fds, nullptr, &timeout);
++    if (ret < 0) {
++        error_out = errno;
++        return false;
++    }
++    if (ret == 0) {
++        error_out = ETIMEDOUT;
++        return false;
++    }
++
++    int socket_error = 0;
++    socklen_t opt_len = sizeof(socket_error);
++    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &opt_len) < 0) {
++        error_out = errno;
++        return false;
++    }
++    if (socket_error != 0) {
++        error_out = socket_error;
++        return false;
++    }
++
++    error_out = 0;
++    return true;
++}
++
+ EspTcp::EspTcp() {
+     event_group_ = xEventGroupCreate();
+ }
+@@ -33,14 +125,19 @@
+     bzero(&server_addr, sizeof(server_addr));
+     server_addr.sin_family = AF_INET;
+     server_addr.sin_port = htons(port);
+-    // host is domain
+-    struct hostent *server = gethostbyname(host.c_str());
+-    if (server == NULL) {
+-        last_error_ = h_errno;
+-        ESP_LOGE(TAG, "Failed to get host by name");
+-        return false;
++    // Prefer literal IPv4 to avoid gethostbyname (extra lwIP semaphores under low internal heap).
++    if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) != 1) {
++        struct hostent* server = gethostbyname(host.c_str());
++        if (server == nullptr) {
++            last_error_ = h_errno;
++            ESP_LOGE(TAG, "Failed to get host by name: %s", host.c_str());
++            return false;
++        }
++        memcpy(&server_addr.sin_addr, server->h_addr, server->h_length);
++        ESP_LOGI(TAG, "Resolved host %s via DNS", host.c_str());
++    } else {
++        ESP_LOGI(TAG, "Using IPv4 literal %s:%d", host.c_str(), port);
+     }
+-    memcpy(&server_addr.sin_addr, server->h_addr, server->h_length);
+ 
+     tcp_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+     if (tcp_fd_ < 0) {
+@@ -48,25 +145,60 @@
+         ESP_LOGE(TAG, "Failed to create socket");
+         return false;
+     }
++    ConfigureSocket(tcp_fd_);
+ 
+     int ret = connect(tcp_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr));
+     if (ret < 0) {
+-        last_error_ = errno;
+-        ESP_LOGE(TAG, "Failed to connect to %s:%d, code=0x%x", host.c_str(), port, last_error_);
+-        close(tcp_fd_);
+-        tcp_fd_ = -1;
+-        return false;
++        int connect_errno = errno;
++        if (connect_errno == EINPROGRESS || connect_errno == EALREADY) {
++            ESP_LOGI(TAG, "Connect in progress for %s:%d", host.c_str(), port);
++            int wait_error = 0;
++            if (!WaitForNonBlockingConnect(tcp_fd_, kTcpConnectTimeoutMs, wait_error)) {
++                last_error_ = wait_error;
++                ESP_LOGE(TAG, "Failed to connect to %s:%d, code=0x%x", host.c_str(), port, last_error_);
++                close(tcp_fd_);
++                tcp_fd_ = -1;
++                return false;
++            }
++        } else {
++            last_error_ = connect_errno;
++            ESP_LOGE(TAG, "Failed to connect to %s:%d, code=0x%x", host.c_str(), port, last_error_);
++            close(tcp_fd_);
++            tcp_fd_ = -1;
++            return false;
++        }
+     }
+ 
+     connected_ = true;
+ 
+     xEventGroupClearBits(event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT);
+-    xTaskCreate([](void* arg) {
+-        EspTcp* tcp = (EspTcp*)arg;
++    auto receive_entry = [](void* arg) {
++        auto* tcp = static_cast<EspTcp*>(arg);
+         tcp->ReceiveTask();
+         xEventGroupSetBits(tcp->event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT);
+-        vTaskDelete(NULL);
+-    }, "tcp_receive", 4096, this, 1, &receive_task_handle_);
++        vTaskDelete(nullptr);
++    };
++
++#if CONFIG_SPIRAM
++    StackType_t* stack =
++        static_cast<StackType_t*>(heap_caps_malloc(kTcpReceiveStackWords * sizeof(StackType_t), MALLOC_CAP_SPIRAM));
++    StaticTask_t* tcb = static_cast<StaticTask_t*>(heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
++    if (stack != nullptr && tcb != nullptr) {
++        receive_task_handle_ = xTaskCreateStatic(receive_entry, "tcp_receive", kTcpReceiveStackWords, this,
++                                                 kTcpReceiveTaskPriority, stack, tcb);
++    }
++#endif
++    if (receive_task_handle_ == nullptr) {
++        if (xTaskCreate(receive_entry, "tcp_receive", kTcpReceiveStackWords, this, kTcpReceiveTaskPriority,
++                        &receive_task_handle_) != pdPASS) {
++            last_error_ = ENOMEM;
++            ESP_LOGE(TAG, "Failed to create tcp_receive task");
++            close(tcp_fd_);
++            tcp_fd_ = -1;
++            connected_ = false;
++            return false;
++        }
++    }
+     return true;
+ }
+ 
+@@ -105,42 +237,104 @@
+ 
+ int EspTcp::Send(const std::string& data) {
+     if (!connected_) {
+-        ESP_LOGE(TAG, "Not connected");
++        ESP_LOGE(TAG, "Tcp Send abort: not connected");
+         return -1;
+     }
+ 
++    const size_t data_size = data.size();
++
+     size_t total_sent = 0;
+-    size_t data_size = data.size();
+     const char* data_ptr = data.data();
+ 
+     while (total_sent < data_size) {
+-        int ret = send(tcp_fd_, data_ptr + total_sent, data_size - total_sent, 0);
++        if (!connected_) {
++            last_error_ = ENOTCONN;
++            ESP_LOGE(TAG, "Tcp Send abort: disconnected while sending %u/%u",
++                     static_cast<unsigned>(total_sent), static_cast<unsigned>(data_size));
++            return -1;
++        }
+ 
+-        if (ret <= 0) {
+-            ESP_LOGE(TAG, "Send failed: ret=%d, errno=%d", ret, errno);
+-            return ret;
++        const size_t remaining = data_size - total_sent;
++        const int ret = send(tcp_fd_, data_ptr + total_sent, remaining, 0);
++
++        if (ret < 0) {
++            const int send_errno = errno;
++            if (send_errno == EINTR) {
++                continue;
++            }
++            if (send_errno == EAGAIN || send_errno == EWOULDBLOCK) {
++                int wait_error = 0;
++                if (WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
++                    continue;
++                }
++                last_error_ = wait_error;
++                ESP_LOGE(TAG, "Tcp send wait failed: errno=%d sent=%u/%u",
++                         wait_error, static_cast<unsigned>(total_sent),
++                         static_cast<unsigned>(data_size));
++                return -1;
++            }
++
++            last_error_ = send_errno;
++            ESP_LOGE(TAG, "Tcp send failed: errno=%d sent=%u/%u", send_errno,
++                     static_cast<unsigned>(total_sent), static_cast<unsigned>(data_size));
++            return -1;
+         }
+ 
+-        total_sent += ret;
++        if (ret == 0) {
++            int wait_error = 0;
++            if (WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
++                continue;
++            }
++            last_error_ = wait_error == 0 ? EPIPE : wait_error;
++            ESP_LOGE(TAG, "Tcp send stalled: errno=%d sent=%u/%u",
++                     last_error_, static_cast<unsigned>(total_sent),
++                     static_cast<unsigned>(data_size));
++            return -1;
++        }
++
++        total_sent += static_cast<size_t>(ret);
++
++        if (total_sent < data_size) {
++            int wait_error = 0;
++            if (!WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
++                last_error_ = wait_error;
++                ESP_LOGE(TAG, "Tcp short send wait failed: wrote=%d sent=%u/%u errno=%d",
++                         ret, static_cast<unsigned>(total_sent),
++                         static_cast<unsigned>(data_size), wait_error);
++                return -1;
++            }
++        }
+     }
+ 
+-    return total_sent;
++    return static_cast<int>(total_sent);
+ }
+ 
+ void EspTcp::ReceiveTask() {
+     std::string data;
+     while (connected_) {
+-        data.resize(1500);
++        data.resize(1024);
+         int ret = recv(tcp_fd_, data.data(), data.size(), 0);
+-        if (ret <= 0) {
+-            if (ret < 0) {
+-                ESP_LOGE(TAG, "TCP receive failed: %d", ret);
++        if (ret < 0) {
++            if (errno == EAGAIN || errno == EWOULDBLOCK) {
++                vTaskDelay(pdMS_TO_TICKS(10));
++                continue;
+             }
++            if (errno == EINTR) {
++                continue;
++            }
++            last_error_ = errno;
++            ESP_LOGE(TAG, "TCP receive failed: %d errno=%d", ret, errno);
+             // 被动断开，不需要等待接收任务退出（当前就是接收任务）
+             DoDisconnect(false);
+             break;
+         }
+ 
++        if (ret == 0) {
++            // 被动断开，不需要等待接收任务退出（当前就是接收任务）
++            DoDisconnect(false);
++            break;
++        }
++
+         if (stream_callback_) {
+             data.resize(ret);
+             stream_callback_(data);
+--- src/web_socket.cc	2026-05-11 16:30:47
++++ src/web_socket.cc	2026-05-23 15:04:56
+@@ -1,6 +1,7 @@
+ #include "web_socket.h"
+ #include "network_interface.h"
+ #include <esp_log.h>
++#include <esp_timer.h>
+ #include <cstdlib>
+ #include <cstring>
+ #include <esp_pthread.h>
+@@ -130,12 +131,30 @@
+     }
+ 
+     connected_ = false;
++    handshake_completed_ = false;
++    receive_buffer_.clear();
++
+     // 使用 tcp 建立连接
+     if (!tcp_->Connect(host, std::stoi(port))) {
+         ESP_LOGE(TAG, "Failed to connect to server");
+         return false;
+     }
+ 
++    // 必须在发送握手请求之前注册接收回调，否则服务端快速返回 101 时数据会被丢弃
++    tcp_->OnStream([this](const std::string& data) {
++        this->OnTcpData(data);
++    });
++    tcp_->OnDisconnected([this]() {
++        if (connected_) {
++            connected_ = false;
++            if (on_disconnected_) {
++                on_disconnected_();
++            }
++        }
++    });
++
++    xEventGroupClearBits(handshake_event_group_, HANDSHAKE_SUCCESS_BIT | HANDSHAKE_FAILED_BIT);
++
+     // 发送 WebSocket 握手请求
+     std::string request = "GET " + path + " HTTP/1.1\r\n";
+     if (headers_.find("Host") == headers_.end()) {
+@@ -151,24 +170,6 @@
+         return false;
+     }
+ 
+-    // 清除事件位
+-    xEventGroupClearBits(handshake_event_group_, HANDSHAKE_SUCCESS_BIT | HANDSHAKE_FAILED_BIT);
+-    
+-    // 设置数据接收回调来处理握手和后续的WebSocket帧
+-    tcp_->OnStream([this](const std::string& data) {
+-        this->OnTcpData(data);
+-    });
+-
+-    // 设置断开连接回调
+-    tcp_->OnDisconnected([this]() {
+-        if (connected_) {
+-            connected_ = false;
+-            if (on_disconnected_) {
+-                on_disconnected_();
+-            }
+-        }
+-    });
+-
+     // 等待握手完成，超时时间10秒
+     EventBits_t bits = xEventGroupWaitBits(
+         handshake_event_group_,
+@@ -191,7 +192,8 @@
+         }
+         return false;
+     } else {
+-        ESP_LOGE(TAG, "WebSocket handshake timeout");
++        ESP_LOGE(TAG, "WebSocket handshake timeout (no HTTP 101 within 10s, host=%s path=%s)",
++                 host.c_str(), path.c_str());
+         return false;
+     }
+ }
+@@ -202,10 +204,19 @@
+ }
+ 
+ bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
++    const int64_t t_enter_us = esp_timer_get_time();
++    ESP_LOGI(TAG, "Send enter: payload=%u binary=%d fin=%d connected=%d",
++             static_cast<unsigned>(len), binary ? 1 : 0, fin ? 1 : 0, connected_ ? 1 : 0);
++
+     if (len > 65535) {
+-        ESP_LOGE(TAG, "Data too large, maximum supported size is 65535 bytes");
++        ESP_LOGE(TAG, "Send abort: payload too large (%u > 65535)", static_cast<unsigned>(len));
+         return false;
+     }
++    if (!connected_ || tcp_ == nullptr) {
++        ESP_LOGW(TAG, "Send abort: not connected (connected=%d tcp=%p)",
++                 connected_ ? 1 : 0, static_cast<void*>(tcp_.get()));
++        return false;
++    }
+ 
+     std::string frame;
+     frame.reserve(len + 8);  // 最大可能的帧大小（2字节帧头 + 2字节长度 + 4字节mask）
+@@ -245,18 +256,50 @@
+     // 更新continuation_状态
+     continuation_ = !fin;
+ 
+-    // 发送帧
++    const int32_t build_us = static_cast<int32_t>(esp_timer_get_time() - t_enter_us);
++    ESP_LOGI(TAG, "Send frame built: wire=%u opcode=0x%02x build_us=%d",
++             static_cast<unsigned>(frame.size()), first_byte, build_us);
++
++    // 持锁发送；优先刷掉 Ping 触发的 Pong。tcp_->Send 带 SO_SNDTIMEO，避免无限阻塞。
+     std::lock_guard<std::mutex> lock(send_mutex_);
+-    return tcp_->Send(frame) >= 0;
++    if (!FlushPendingPongLocked()) {
++        ESP_LOGW(TAG, "Send: pending Pong flush failed");
++    }
++    const int64_t t_tcp_before_us = esp_timer_get_time();
++    const int tcp_ret = tcp_->Send(frame);
++    const int32_t tcp_us = static_cast<int32_t>(esp_timer_get_time() - t_tcp_before_us);
++    const int32_t total_us = static_cast<int32_t>(esp_timer_get_time() - t_enter_us);
++    const bool ok = tcp_ret >= 0 && static_cast<size_t>(tcp_ret) == frame.size();
++
++    if (!ok) {
++        ESP_LOGW(TAG, "Send tcp failed: ret=%d wire=%u tcp_us=%d total_us=%d",
++                 tcp_ret, static_cast<unsigned>(frame.size()), tcp_us, total_us);
++        connected_ = false;
++        if (tcp_ != nullptr) {
++            tcp_->Disconnect();
++        }
++    }
++    return ok;
+ }
+ 
+ void WebSocket::Ping() {
+-    SendControlFrame(0x9, nullptr, 0);
++    ESP_LOGI(TAG, "Ping: sending client ping");
++    const bool ok = SendControlFrame(0x9, nullptr, 0);
++    ESP_LOGI(TAG, "Ping: send %s", ok ? "ok" : "failed");
+ }
+ 
+ void WebSocket::Close() {
+     if (connected_) {
+         SendControlFrame(0x8, nullptr, 0);
++    }
++}
++
++void WebSocket::ShutdownTransport() {
++    connected_ = false;
++    handshake_completed_ = false;
++    std::lock_guard<std::mutex> lock(send_mutex_);
++    if (tcp_ != nullptr) {
++        tcp_->Disconnect();
+     }
+ }
+ 
+@@ -387,9 +430,18 @@
+                 }
+                 break;
+             case 0x9: // Ping
+-                SendControlFrame(0xA, payload.data(), payload_length);
++                ESP_LOGI(TAG, "Recv Ping: payload=%u fin=%d",
++                         static_cast<unsigned>(payload_length), fin ? 1 : 0);
++                QueuePendingPong(payload.data(), payload_length);
++                if (TryFlushPendingPong()) {
++                    ESP_LOGI(TAG, "Reply Pong: payload=%u ok=1", static_cast<unsigned>(payload_length));
++                } else {
++                    ESP_LOGW(TAG, "Reply Pong: deferred (payload=%u)", static_cast<unsigned>(payload_length));
++                }
+                 break;
+             case 0xA: // Pong
++                ESP_LOGI(TAG, "Recv Pong: payload=%u fin=%d",
++                         static_cast<unsigned>(payload_length), fin ? 1 : 0);
+                 break;
+             default:
+                 ESP_LOGE(TAG, "Unknown opcode: %d", opcode);
+@@ -407,35 +459,73 @@
+ 
+ 
+ 
+-bool WebSocket::SendControlFrame(uint8_t opcode, const void* data, size_t len) {
++void WebSocket::QueuePendingPong(const void* data, size_t len) {
++    std::lock_guard<std::mutex> lock(pong_queue_mutex_);
++    pending_pong_payload_.assign(static_cast<const char*>(data), static_cast<const char*>(data) + len);
++    pending_pong_ = true;
++}
++
++bool WebSocket::TryFlushPendingPong() {
++    {
++        std::lock_guard<std::mutex> lock(pong_queue_mutex_);
++        if (!pending_pong_) {
++            return true;
++        }
++    }
++    std::unique_lock<std::mutex> lock(send_mutex_, std::try_to_lock);
++    if (!lock.owns_lock()) {
++        return false;
++    }
++    return FlushPendingPongLocked();
++}
++
++bool WebSocket::FlushPendingPongLocked() {
++    std::vector<char> pong_payload;
++    {
++        std::lock_guard<std::mutex> lock(pong_queue_mutex_);
++        if (!pending_pong_) {
++            return true;
++        }
++        pong_payload = std::move(pending_pong_payload_);
++        pending_pong_ = false;
++    }
++    return SendControlFrameUnlocked(0xA, pong_payload.data(), pong_payload.size());
++}
++
++bool WebSocket::SendControlFrameUnlocked(uint8_t opcode, const void* data, size_t len) {
+     if (len > 125) {
+-        ESP_LOGE(TAG, "控制帧有效载荷过大");
++        ESP_LOGE(TAG, "Control frame payload too large (%u > 125)", static_cast<unsigned>(len));
+         return false;
+     }
++    if (!connected_ || tcp_ == nullptr) {
++        return false;
++    }
+ 
+     std::string frame;
+-    frame.reserve(len + 6);  // 帧头 + 掩码 + 有效载荷
++    frame.reserve(len + 6);
+ 
+-    // 第一个字节：FIN 位 + 操作码
+     frame.push_back(static_cast<char>(0x80 | opcode));
+-
+-    // 第二个字节：MASK 位 + 有效载荷长度
+     frame.push_back(static_cast<char>(0x80 | len));
+ 
+-    // 生成随机的4字节掩码
+     uint8_t mask[4];
+     for (int i = 0; i < 4; ++i) {
+         mask[i] = rand() & 0xFF;
+     }
+     frame.append(reinterpret_cast<const char*>(mask), 4);
+ 
+-    // 添加并掩码处理有效载荷
+     const uint8_t* payload = static_cast<const uint8_t*>(data);
+     for (size_t i = 0; i < len; ++i) {
+         frame.push_back(static_cast<char>(payload[i] ^ mask[i % 4]));
+     }
+ 
+-    // 发送帧
++    const int tcp_ret = tcp_->Send(frame);
++    return tcp_ret >= 0 && static_cast<size_t>(tcp_ret) == frame.size();
++}
++
++bool WebSocket::SendControlFrame(uint8_t opcode, const void* data, size_t len) {
+     std::lock_guard<std::mutex> lock(send_mutex_);
+-    return tcp_->Send(frame) >= 0;
++    if (!FlushPendingPongLocked()) {
++        ESP_LOGW(TAG, "SendControlFrame: pending Pong flush failed");
++    }
++    return SendControlFrameUnlocked(opcode, data, len);
+ }
+\ No newline at end of file
+--- include/web_socket.h	2026-05-11 16:30:47
++++ include/web_socket.h	2026-05-23 15:04:36
+@@ -27,6 +27,8 @@
+     bool Send(const void* data, size_t len, bool binary = false, bool fin = true);
+     void Ping();
+     void Close();
++    /** 立即断开底层 TCP，用于解除阻塞中的 send()。 */
++    void ShutdownTransport();
+ 
+     void OnConnected(std::function<void()> callback);
+     void OnDisconnected(std::function<void()> callback);
+@@ -65,6 +67,14 @@
+ 
+     void OnTcpData(const std::string& data);
+     bool SendControlFrame(uint8_t opcode, const void* data, size_t len);
++    bool SendControlFrameUnlocked(uint8_t opcode, const void* data, size_t len);
++    void QueuePendingPong(const void* data, size_t len);
++    bool TryFlushPendingPong();
++    bool FlushPendingPongLocked();
++
++    std::mutex pong_queue_mutex_;
++    std::vector<char> pending_pong_payload_;
++    bool pending_pong_ = false;
+ };
+ 
+ #endif // WEBSOCKET_H

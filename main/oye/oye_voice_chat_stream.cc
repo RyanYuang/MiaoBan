@@ -12,7 +12,6 @@
 #include <mbedtls/base64.h>
 #include <web_socket.h>
 
-#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -27,9 +26,11 @@ constexpr size_t kLogTextMax = 160;
 constexpr size_t kMinLargestInternalForWs = 4096;
 constexpr int kWsConnectAttempts = 3;
 constexpr int kWsRetryDelayMs = 400;
-constexpr int kSendTaskStackWords = 6144;
-constexpr int kSendTaskStackWordsInternalFallback = 2560;
+constexpr uint32_t kSendTaskStackBytes = 6144;
+constexpr uint32_t kSendTaskStackBytesInternalFallback = 2560;
 constexpr UBaseType_t kSendTaskPriority = 5;
+constexpr int kPcmSendRetryDelayMs = 20;
+constexpr int kPcmSendRetryMaxAttempts = 250;
 
 void LogTextPreview(const char* label, const std::string& text) {
     if (text.empty()) {
@@ -140,86 +141,81 @@ void VoiceChatStream::SendTaskEntry(void* arg) {
     static_cast<VoiceChatStream*>(arg)->PcmSendTask();
 }
 
-void VoiceChatStream::FreeSendTaskResources() {
-    if (send_task_stack_ != nullptr) {
-        heap_caps_free(send_task_stack_);
-        send_task_stack_ = nullptr;
-    }
-    if (send_task_tcb_ != nullptr) {
-        heap_caps_free(send_task_tcb_);
-        send_task_tcb_ = nullptr;
-    }
-}
-
 bool VoiceChatStream::StartSendTask() {
-    FreeSendTaskResources();
     send_task_run_ = true;
+    send_task_handle_ = nullptr;
     xEventGroupClearBits(done_event_, kSendTaskExitBit);
 
-    send_task_stack_ = static_cast<StackType_t*>(heap_caps_malloc(
-        static_cast<size_t>(kSendTaskStackWords) * sizeof(StackType_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    send_task_tcb_ =
-        static_cast<StaticTask_t*>(heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
-    if (send_task_stack_ != nullptr && send_task_tcb_ != nullptr) {
-        send_task_handle_ = xTaskCreateStatic(SendTaskEntry, "oye_vc_pcm", kSendTaskStackWords, this,
-                                              kSendTaskPriority, send_task_stack_, send_task_tcb_);
-        if (send_task_handle_ != nullptr) {
-            ESP_LOGI(TAG, "PCM send task created (SPIRAM stack %d words)", kSendTaskStackWords);
-            return true;
-        }
-        ESP_LOGW(TAG, "xTaskCreateStatic failed, try internal fallback");
-        FreeSendTaskResources();
-    } else {
-        ESP_LOGW(TAG, "SPIRAM stack alloc failed, try internal fallback");
-        FreeSendTaskResources();
+    if (xTaskCreateWithCaps(SendTaskEntry, "oye_vc_pcm", kSendTaskStackBytes, this, kSendTaskPriority,
+                            &send_task_handle_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS) {
+        ESP_LOGI(TAG, "PCM send task created (SPIRAM stack %u bytes)",
+                 static_cast<unsigned>(kSendTaskStackBytes));
+        return true;
     }
 
     LogHeap("StartSendTask fallback");
-    if (xTaskCreate(SendTaskEntry, "oye_vc_pcm", kSendTaskStackWordsInternalFallback, this, kSendTaskPriority,
-                    &send_task_handle_) != pdPASS) {
+    if (xTaskCreateWithCaps(SendTaskEntry, "oye_vc_pcm", kSendTaskStackBytesInternalFallback, this,
+                            kSendTaskPriority, &send_task_handle_,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         send_task_run_ = false;
         send_task_handle_ = nullptr;
         ESP_LOGE(TAG, "StartSendTask: xTaskCreate failed (need largest>=%u)",
-                 static_cast<unsigned>(kSendTaskStackWordsInternalFallback * sizeof(StackType_t)));
+                 static_cast<unsigned>(kSendTaskStackBytesInternalFallback));
         return false;
     }
-    ESP_LOGI(TAG, "PCM send task created (internal stack %d words)", kSendTaskStackWordsInternalFallback);
+    ESP_LOGI(TAG, "PCM send task created (internal stack %u bytes)",
+             static_cast<unsigned>(kSendTaskStackBytesInternalFallback));
     return true;
 }
 
 void VoiceChatStream::StopSendTask() {
     send_task_run_ = false;
     if (send_task_handle_ == nullptr) {
-        FreeSendTaskResources();
         return;
     }
     xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, pdMS_TO_TICKS(3000));
     send_task_handle_ = nullptr;
-    FreeSendTaskResources();
 }
 
 void VoiceChatStream::PcmSendTask() {
-    // 独立发送任务：从 pcm_queue_ 取 60ms 定长帧并经 WebSocket 二进制上行。
+    // 独立发送任务：从 pcm_queue_ 取 20ms 定长帧并经 WebSocket 二进制上行。
     // FeedPcm 只负责拼帧入队，避免在音频回调里执行 Send 阻塞采集链路。
     while (send_task_run_) {
         // 100ms 超时：队列空时也能周期性检查 send_task_run_，Stop 时可及时退出。
         if (xQueueReceive(pcm_queue_, send_frame_, pdMS_TO_TICKS(100)) != pdTRUE) {
             continue;
         }
-        // 会话未就绪或已停流时丢弃该帧（队列里可能仍有 Stop 前的残留帧）。
-        if (stream_ready_ && running_ && websocket_ != nullptr) {
-            SendPcmChunk(send_frame_, kPcmFrameSamples);
+        if (!stream_ready_ || !running_ || websocket_ == nullptr) {
+            continue;
+        }
+
+        pcm_accept_feed_ = false;
+        bool sent = false;
+        for (int attempt = 0; send_task_run_ && stream_ready_ && running_; ++attempt) {
+            if (SendPcmChunk(send_frame_, kPcmFrameSamples)) {
+                sent = true;
+                break;
+            }
+            if (attempt + 1 >= kPcmSendRetryMaxAttempts) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kPcmSendRetryDelayMs));
+        }
+
+        if (sent) {
+            pcm_accept_feed_ = true;
+        } else {
+            ESP_LOGE(TAG, "PCM send gave up after retries, halt uplink");
+            stream_ready_ = false;
+            pcm_accept_feed_ = false;
         }
     }
-    // 主循环退出后 drain 队列：Stop 已置 running_=false，但仍尽量在关 WS 前发完积压帧。
+    // Stop 时不再 drain 发送，避免在已阻塞的 TCP 上继续 Send。
     while (xQueueReceive(pcm_queue_, send_frame_, 0) == pdTRUE) {
-        if (websocket_ != nullptr) {
-            SendPcmChunk(send_frame_, kPcmFrameSamples);
-        }
     }
     send_task_handle_ = nullptr;
     xEventGroupSetBits(done_event_, kSendTaskExitBit);
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallback on_asr_final,
@@ -241,13 +237,13 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
     pcm_feed_count_ = 0;
     pcm_bytes_sent_ = 0;
     pcm_queue_drops_ = 0;
-    pcm_accum_trims_ = 0;
     pcm_accum_.clear();
     pcm_accum_.reserve(kPcmAccumMaxSamples);
     next_tts_seq_ = 0;
     user_text_.clear();
     assistant_text_.clear();
     stream_ready_ = false;
+    pcm_accept_feed_ = false;
     session_finished_ = false;
     if (done_event_ != nullptr) {
         xEventGroupClearBits(done_event_, kDoneReceivedBit | kSendTaskExitBit);
@@ -284,6 +280,7 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
                  static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                  static_cast<unsigned>(pcm_queue_drops_));
         stream_ready_ = false;
+        pcm_accept_feed_ = false;
         running_ = false;
         send_task_run_ = false;
         SignalSessionEnd();
@@ -345,28 +342,26 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
 
     running_ = true;
     stream_ready_ = true;
+    pcm_accept_feed_ = true;
     return true;
 }
 
 /**
  * 将一帧 PCM 以 WebSocket 二进制帧发送到 /voice-chat/ws。
- * 由 PcmSendTask 从队列取出定长帧（默认 960 样点 ≈ 60ms @16kHz）后调用，不在音频回调里直接 Send。
+ * 由 PcmSendTask 从队列取出定长帧（默认 320 样点 ≈ 20ms @16kHz）后调用，不在音频回调里直接 Send。
  *
  * @param samples 16-bit 单声道 PCM 缓冲区
- * @param count   样点数（通常 kPcmFrameSamples=960）
+ * @param count   样点数（通常 kPcmFrameSamples=320）
  * @return 发送成功 true；参数无效、未连接或 Send 失败 false
  */
 bool VoiceChatStream::SendPcmChunk(const int16_t* samples, size_t count) {
-    printf("SendPcmChunk: %p\n", samples);
     // 无 socket、空指针或 0 长度 → 直接失败（调用方应保证 count 为整帧）
     if (websocket_ == nullptr || samples == nullptr || count == 0) {
-        printf("SendPcmChunk: invalid parameters\n");
         return false;
     }
     auto* socket = static_cast<WebSocket*>(websocket_);
     // 连接已断：标记 stream 不可用，后续 FeedPcm 入队帧会在发送任务里被丢弃
     if (!socket->IsConnected()) {
-        printf("SendPcmChunk: not connected\n");
         stream_ready_ = false;
         return false;
     }
@@ -374,7 +369,6 @@ bool VoiceChatStream::SendPcmChunk(const int16_t* samples, size_t count) {
     const size_t bytes = count * sizeof(int16_t);
     // binary=true：服务端按二进制 PCM 解析（s16le 16kHz mono，与 start JSON 中 audio 一致）
     if (!socket->Send(reinterpret_cast<const char*>(samples), bytes, true)) {
-        printf("SendPcmChunk: send failed: %d\n", socket->GetLastError());
         if (!socket->IsConnected()) {
             // 发送过程中断线：停流并清 stream_ready_，避免继续往死连接写数据
             stream_ready_ = false;
@@ -383,13 +377,11 @@ bool VoiceChatStream::SendPcmChunk(const int16_t* samples, size_t count) {
                      static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                      socket->GetLastError());
         } else {
-            // 仍显示 connected 但 Send 失败（缓冲满、TLS 等），本帧丢弃，不立刻停会话
-            ESP_LOGW(TAG, "binary PCM send failed (%u bytes) err=%d", static_cast<unsigned>(bytes),
-                     socket->GetLastError());
+            ESP_LOGD(TAG, "binary PCM send blocked (%u bytes) err=%d, will retry",
+                     static_cast<unsigned>(bytes), socket->GetLastError());
         }
         return false;
     }
-    printf("SendPcmChunk: send success\n");
 
     // 统计上行：首帧与每 50 帧打一次日志，便于确认麦数据是否真的发出
     ++pcm_feed_count_;
@@ -403,50 +395,25 @@ bool VoiceChatStream::SendPcmChunk(const int16_t* samples, size_t count) {
     return true;
 }
 
-void VoiceChatStream::TrimPcmAccumIfNeeded() {
-    while (pcm_accum_.size() > kPcmAccumMaxSamples) {
-        size_t excess = pcm_accum_.size() - kPcmAccumMaxSamples;
-        size_t drop = (excess / kPcmFrameSamples) * kPcmFrameSamples;
-        if (drop == 0) {
-            drop = excess;
-        }
-        pcm_accum_.erase(pcm_accum_.begin(), pcm_accum_.begin() + drop);
-        ++pcm_accum_trims_;
-        if ((pcm_accum_trims_ % 10) == 1) {
-            ESP_LOGW(TAG, "pcm_accum trimmed oldest (trims=%u accum=%u max=%u)",
-                     static_cast<unsigned>(pcm_accum_trims_), static_cast<unsigned>(pcm_accum_.size()),
-                     static_cast<unsigned>(kPcmAccumMaxSamples));
-        }
-    }
-}
-
 void VoiceChatStream::FlushPcmAccumToQueue() {
-    if (pcm_queue_ == nullptr) {
+    if (!pcm_accept_feed_ || pcm_queue_ == nullptr) {
         return;
     }
     while (pcm_accum_.size() >= kPcmFrameSamples) {
         if (xQueueSend(pcm_queue_, pcm_accum_.data(), 0) != pdTRUE) {
-            printf("FlushPcmAccumToQueue: failed\n");
-            ++pcm_queue_drops_;
-            if ((pcm_queue_drops_ % 10) == 1) {
-                ESP_LOGW(TAG, "PCM queue full, dropped frame (drops=%u accum=%u)",
-                         static_cast<unsigned>(pcm_queue_drops_),
-                         static_cast<unsigned>(pcm_accum_.size()));
-            }
-            TrimPcmAccumIfNeeded();
+            pcm_accept_feed_ = false;
             return;
         }
-        printf("FlushPcmAccumToQueue: success\n");
         pcm_accum_.erase(pcm_accum_.begin(), pcm_accum_.begin() + kPcmFrameSamples);
     }
 }
 
 void VoiceChatStream::FeedPcm(const int16_t* samples, size_t count) {
-    if (!running_ || !stream_ready_ || pcm_queue_ == nullptr || samples == nullptr || count == 0) {
+    if (!running_ || !stream_ready_ || !pcm_accept_feed_ || pcm_queue_ == nullptr || samples == nullptr ||
+        count == 0) {
         return;
     }
     pcm_accum_.insert(pcm_accum_.end(), samples, samples + count);
-    TrimPcmAccumIfNeeded();
     FlushPcmAccumToQueue();
 }
 
@@ -473,27 +440,32 @@ void VoiceChatStream::Stop(bool wait_for_done) {
     }
 
     stream_ready_ = false;
+    pcm_accept_feed_ = false;
     running_ = false;
-    FlushPcmAccumToQueue();
+    send_task_run_ = false;
+
+    if (websocket_ != nullptr) {
+        auto* socket = static_cast<WebSocket*>(websocket_);
+        ESP_LOGI(TAG, "Stop: sending end (feeds=%u bytes=%u wait_done=%d)",
+                 static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
+                 wait_for_done ? 1 : 0);
+        if (socket->IsConnected()) {
+            if (!socket->Send(R"({"action":"end"})")) {
+                wait_for_done = false;
+            }
+        }
+        socket->ShutdownTransport();
+    }
+
     StopSendTask();
     DestroyPcmQueue();
     pcm_accum_.clear();
 
-    if (websocket_ != nullptr) {
-        ESP_LOGI(TAG, "Stop: sending end (feeds=%u bytes=%u wait_done=%d)",
-                 static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
-                 wait_for_done ? 1 : 0);
-        auto* socket = static_cast<WebSocket*>(websocket_);
-        if (!socket->Send(R"({"action":"end"})")) {
-            wait_for_done = false;
-        }
-
-        if (wait_for_done && !session_finished_ && done_event_ != nullptr) {
-            const EventBits_t bits =
-                xEventGroupWaitBits(done_event_, kDoneReceivedBit, pdFALSE, pdTRUE, kDoneWaitTicks);
-            if ((bits & kDoneReceivedBit) == 0) {
-                ESP_LOGW(TAG, "Stop: voice_chat_done timeout");
-            }
+    if (websocket_ != nullptr && wait_for_done && !session_finished_ && done_event_ != nullptr) {
+        const EventBits_t bits =
+            xEventGroupWaitBits(done_event_, kDoneReceivedBit, pdFALSE, pdTRUE, kDoneWaitTicks);
+        if ((bits & kDoneReceivedBit) == 0) {
+            ESP_LOGW(TAG, "Stop: voice_chat_done timeout");
         }
     }
 

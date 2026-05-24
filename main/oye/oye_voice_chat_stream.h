@@ -11,6 +11,7 @@ class WebSocket;
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
+#include <freertos/idf_additions.h>
 #include <freertos/queue.h>
 
 namespace oye {
@@ -35,24 +36,26 @@ public:
 
 private:
     static constexpr TickType_t kDoneWaitTicks = pdMS_TO_TICKS(120000);
-    static constexpr size_t kPcmFrameSamples = 960;
+    /** 20ms @16kHz. Keep WS/TCP frames small enough for ESP32-S3's tight lwIP send window. */
+    static constexpr size_t kPcmFrameSamples = 320;
     static constexpr size_t kPcmFrameBytes = kPcmFrameSamples * sizeof(int16_t);
-    static constexpr UBaseType_t kPcmQueueDepth = 6;
-    /** Max samples held in pcm_accum_ (~8 frames); excess drops oldest first. */
-    static constexpr size_t kPcmAccumMaxSamples = kPcmFrameSamples * (kPcmQueueDepth + 2);
+    /** 仅缓存在途 2 帧，避免 send 阻塞时队列堆满占内存。 */
+    static constexpr UBaseType_t kPcmQueueDepth = 2;
+    static constexpr size_t kPcmAccumMaxSamples = kPcmFrameSamples * 3;
 
     static constexpr EventBits_t kDoneReceivedBit = BIT0;
     static constexpr EventBits_t kSendTaskExitBit = BIT1;
 
     bool running_ = false;
     bool stream_ready_ = false;
+    /** false 时 FeedPcm 不入 accum/队列，直至当前帧发送成功后再置 true。 */
+    volatile bool pcm_accept_feed_ = false;
     bool session_finished_ = false;
     bool transport_boost_ = false;
     volatile bool send_task_run_ = false;
     uint32_t pcm_feed_count_ = 0;
     uint32_t pcm_bytes_sent_ = 0;
     uint32_t pcm_queue_drops_ = 0;
-    uint32_t pcm_accum_trims_ = 0;
     int next_tts_seq_ = 0;
     std::string user_text_;
     std::string assistant_text_;
@@ -69,13 +72,10 @@ private:
     uint8_t* pcm_queue_storage_ = nullptr;
     StaticQueue_t pcm_queue_buffer_{};
     TaskHandle_t send_task_handle_ = nullptr;
-    StackType_t* send_task_stack_ = nullptr;
-    StaticTask_t* send_task_tcb_ = nullptr;
     int16_t send_frame_[kPcmFrameSamples];
     std::vector<int16_t> pcm_accum_;
 
     static void SendTaskEntry(void* arg);
-    void TrimPcmAccumIfNeeded();
     void FlushPcmAccumToQueue();
     void HandleText(const char* data, size_t len);
     bool SendPcmChunk(const int16_t* samples, size_t count);
@@ -87,7 +87,6 @@ private:
     void DestroyPcmQueue();
     bool StartSendTask();
     void StopSendTask();
-    void FreeSendTaskResources();
     void PcmSendTask();
 };
 
