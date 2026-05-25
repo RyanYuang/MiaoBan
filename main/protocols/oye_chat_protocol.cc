@@ -195,6 +195,15 @@ void OyeChatProtocol::SendStartListening(ListeningMode mode) {
                 ESP_LOGW(TAG, "[voice-chat] [4b] schedule_ null, drop final stt");
             }
         },
+        // 4b2) 后端确认进入 LLM 阶段：页面可显示“ASR 已结束，正在思考”
+        [this]() {
+            ESP_LOGI(TAG, "[voice-chat] [4b2] LLM start");
+            if (schedule_) {
+                schedule_([this]() { EmitJson("chat_stage", "", "thinking"); });
+            } else {
+                ESP_LOGW(TAG, "[voice-chat] [4b2] schedule_ null, drop thinking stage");
+            }
+        },
         // 4c) LLM 流式文本 → 转成 tts + sentence_start，更新助手字幕（尚未播音）
         [this](const std::string& text) {
             ESP_LOGI(TAG, "[voice-chat] [4c] LLM chunk len=%u", static_cast<unsigned>(text.size()));

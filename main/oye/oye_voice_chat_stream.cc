@@ -219,8 +219,9 @@ void VoiceChatStream::PcmSendTask() {
 }
 
 bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallback on_asr_final,
-                            TextCallback on_llm_text, std::function<void(const char* state)> on_tts_state,
-                            DoneCallback on_done, ErrorCallback on_error) {
+                            std::function<void()> on_llm_start, TextCallback on_llm_text,
+                            std::function<void(const char* state)> on_tts_state, DoneCallback on_done,
+                            ErrorCallback on_error) {
     ESP_LOGI(TAG, "Start chat_session_id=%d", chat_session_id);
     Stop(false);
     if (!HasAccessToken()) {
@@ -230,6 +231,7 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
 
     on_asr_ = std::move(on_asr);
     on_asr_final_ = std::move(on_asr_final);
+    on_llm_start_ = std::move(on_llm_start);
     on_llm_text_ = std::move(on_llm_text);
     on_tts_state_ = std::move(on_tts_state);
     on_done_ = std::move(on_done);
@@ -454,7 +456,11 @@ void VoiceChatStream::Stop(bool wait_for_done) {
                 wait_for_done = false;
             }
         }
-        socket->ShutdownTransport();
+        if (!wait_for_done) {
+            socket->ShutdownTransport();
+        } else {
+            ESP_LOGI(TAG, "Stop: keep WS transport open for llm/tts/voice_chat_done");
+        }
     }
 
     StopSendTask();
@@ -466,6 +472,7 @@ void VoiceChatStream::Stop(bool wait_for_done) {
             xEventGroupWaitBits(done_event_, kDoneReceivedBit, pdFALSE, pdTRUE, kDoneWaitTicks);
         if ((bits & kDoneReceivedBit) == 0) {
             ESP_LOGW(TAG, "Stop: voice_chat_done timeout");
+            static_cast<WebSocket*>(websocket_)->ShutdownTransport();
         }
     }
 
@@ -510,6 +517,9 @@ void VoiceChatStream::HandleText(const char* data, size_t len) {
     } else if (strcmp(t, "llm_start") == 0) {
         auto sid = cJSON_GetObjectItem(root, "chat_session_id");
         ESP_LOGI(TAG, "WS llm_start session=%d", cJSON_IsNumber(sid) ? sid->valueint : -1);
+        if (on_llm_start_) {
+            on_llm_start_();
+        }
     } else if (strcmp(t, "llm_text") == 0) {
         auto text = cJSON_GetObjectItem(root, "text");
         if (cJSON_IsString(text)) {

@@ -27,7 +27,8 @@ public:
     VoiceChatStream();
     ~VoiceChatStream();
 
-    bool Start(int chat_session_id, TextCallback on_asr, TextCallback on_asr_final, TextCallback on_llm_text,
+    bool Start(int chat_session_id, TextCallback on_asr, TextCallback on_asr_final,
+               std::function<void()> on_llm_start, TextCallback on_llm_text,
                std::function<void(const char* state)> on_tts_state, DoneCallback on_done,
                ErrorCallback on_error);
     void FeedPcm(const int16_t* samples, size_t count);
@@ -62,6 +63,7 @@ private:
     mutable std::mutex mutex_;
     TextCallback on_asr_;
     TextCallback on_asr_final_;
+    std::function<void()> on_llm_start_;
     TextCallback on_llm_text_;
     std::function<void(const char* state)> on_tts_state_;
     DoneCallback on_done_;

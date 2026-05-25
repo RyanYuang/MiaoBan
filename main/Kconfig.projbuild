@@ -90,6 +90,16 @@ menu "Oye diagnostics"
         help
             Maximum listening time before auto-stopping when no speech is
             detected. Set to 0 to disable this timeout.
+
+config OYE_SPEECH_END_MAX_LISTEN_MS
+    int "Oye max listening duration (ms)"
+    depends on OYE_SPEECH_END_DETECTION
+    default 10000
+    range 0 60000
+    help
+        Hard listening timeout counted from the moment Oye enters
+        auto-stop listening. When reached, ASR is force-ended even if
+        speech is still active. Set to 0 to disable this timeout.
 endmenu
 
 choice

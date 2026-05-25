@@ -36,6 +36,10 @@
 namespace {
 constexpr char TAG[] = "Application";
 
+bool ShouldMuteErrorAlertSound(const std::string& message) {
+    return message.find("未识别到有效语音内容") != std::string::npos;
+}
+
 #if CONFIG_OYE_SERIAL_TEST_TRIGGER
 void SerialTestTriggerTask(void*) {
     ESP_LOGI(TAG, "Serial test trigger ready: v=start voice, s=stop, t=toggle");
@@ -164,6 +168,18 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&speech_end_timer_args, &speech_end_timer_handle_);
+
+    esp_timer_create_args_t max_listen_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_MAX_LISTEN_TIMEOUT);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "max_listen",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&max_listen_timer_args, &max_listen_timer_handle_);
 }
 
 /**
@@ -177,6 +193,10 @@ Application::~Application() {
     if (speech_end_timer_handle_ != nullptr) {
         esp_timer_stop(speech_end_timer_handle_);
         esp_timer_delete(speech_end_timer_handle_);
+    }
+    if (max_listen_timer_handle_ != nullptr) {
+        esp_timer_stop(max_listen_timer_handle_);
+        esp_timer_delete(max_listen_timer_handle_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -215,6 +235,40 @@ void Application::RemoveRecognitionTextListener(int listener_id)
         std::remove_if(recognition_text_listeners_.begin(), recognition_text_listeners_.end(),
             [listener_id](const auto& entry) { return entry.first == listener_id; }),
         recognition_text_listeners_.end());
+}
+
+int Application::AddAssistantTextListener(AssistantTextCallback callback)
+{
+    std::lock_guard<std::mutex> lock(assistant_text_listeners_mutex_);
+    const int id = next_assistant_text_listener_id_++;
+    assistant_text_listeners_.emplace_back(id, std::move(callback));
+    return id;
+}
+
+void Application::RemoveAssistantTextListener(int listener_id)
+{
+    std::lock_guard<std::mutex> lock(assistant_text_listeners_mutex_);
+    assistant_text_listeners_.erase(
+        std::remove_if(assistant_text_listeners_.begin(), assistant_text_listeners_.end(),
+            [listener_id](const auto& entry) { return entry.first == listener_id; }),
+        assistant_text_listeners_.end());
+}
+
+int Application::AddChatStatusListener(ChatStatusCallback callback)
+{
+    std::lock_guard<std::mutex> lock(chat_status_listeners_mutex_);
+    const int id = next_chat_status_listener_id_++;
+    chat_status_listeners_.emplace_back(id, std::move(callback));
+    return id;
+}
+
+void Application::RemoveChatStatusListener(int listener_id)
+{
+    std::lock_guard<std::mutex> lock(chat_status_listeners_mutex_);
+    chat_status_listeners_.erase(
+        std::remove_if(chat_status_listeners_.begin(), chat_status_listeners_.end(),
+            [listener_id](const auto& entry) { return entry.first == listener_id; }),
+        chat_status_listeners_.end());
 }
 
 /**
@@ -367,14 +421,18 @@ void Application::Run() {
         MAIN_EVENT_STOP_LISTENING |       // 主动停止监听
         MAIN_EVENT_ACTIVATION_DONE |      // 激活流程完成
         MAIN_EVENT_STATE_CHANGED |        // 状态机状态变化
-        MAIN_EVENT_SPEECH_END_DETECTED;   // 本地端点检测确认说话结束
+        MAIN_EVENT_SPEECH_END_DETECTED |  // 本地端点检测确认说话结束
+        MAIN_EVENT_MAX_LISTEN_TIMEOUT;    // 达到硬性最大监听时长
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
         if (bits & MAIN_EVENT_ERROR) {
             // 错误统一收敛到空闲态，并弹出错误提示。
             SetDeviceState(kDeviceStateIdle);
-            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+            const auto sound = ShouldMuteErrorAlertSound(last_error_message_)
+                ? std::string_view{}
+                : std::string_view{Lang::Sounds::OGG_EXCLAMATION};
+            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", sound);
         }
 
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
@@ -434,6 +492,10 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SPEECH_END_DETECTED) {
             HandleSpeechEndDetectedEvent();
+        }
+
+        if (bits & MAIN_EVENT_MAX_LISTEN_TIMEOUT) {
+            HandleMaxListenTimeoutEvent();
         }
 
         if (bits & MAIN_EVENT_SCHEDULE) {
@@ -809,8 +871,9 @@ void Application::InitializeProtocol() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    UiCommandDispatcher::Instance().Post([display, message = std::string(text->valuestring)]() {
+                    UiCommandDispatcher::Instance().Post([this, display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("assistant", message.c_str());
+                        NotifyAssistantTextListeners(message);
                     });
                 }
             }
@@ -821,6 +884,13 @@ void Application::InitializeProtocol() {
                 UiCommandDispatcher::Instance().Post([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                     NotifyRecognitionTextListeners(message);
+                });
+            }
+        } else if (strcmp(type->valuestring, "chat_stage") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (cJSON_IsString(state) && strcmp(state->valuestring, "thinking") == 0) {
+                UiCommandDispatcher::Instance().Post([this]() {
+                    NotifyChatStatusListeners("ASR 已结束，正在思考…");
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -1046,6 +1116,44 @@ void Application::NotifyRecognitionTextListeners(const std::string& text)
         std::lock_guard<std::mutex> lock(recognition_text_listeners_mutex_);
         callbacks_copy.reserve(recognition_text_listeners_.size());
         for (const auto& [id, callback] : recognition_text_listeners_) {
+            (void)id;
+            callbacks_copy.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : callbacks_copy) {
+        if (callback != nullptr) {
+            callback(text);
+        }
+    }
+}
+
+void Application::NotifyAssistantTextListeners(const std::string& text)
+{
+    std::vector<AssistantTextCallback> callbacks_copy;
+    {
+        std::lock_guard<std::mutex> lock(assistant_text_listeners_mutex_);
+        callbacks_copy.reserve(assistant_text_listeners_.size());
+        for (const auto& [id, callback] : assistant_text_listeners_) {
+            (void)id;
+            callbacks_copy.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : callbacks_copy) {
+        if (callback != nullptr) {
+            callback(text);
+        }
+    }
+}
+
+void Application::NotifyChatStatusListeners(const std::string& text)
+{
+    std::vector<ChatStatusCallback> callbacks_copy;
+    {
+        std::lock_guard<std::mutex> lock(chat_status_listeners_mutex_);
+        callbacks_copy.reserve(chat_status_listeners_.size());
+        for (const auto& [id, callback] : chat_status_listeners_) {
             (void)id;
             callbacks_copy.push_back(callback);
         }
@@ -1310,6 +1418,23 @@ void Application::ArmSpeechEndTimer(SpeechEndTimerReason reason, uint32_t timeou
 #endif
 }
 
+void Application::ArmMaxListenTimer(uint32_t timeout_ms) {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    if (max_listen_timer_handle_ == nullptr || timeout_ms == 0) {
+        return;
+    }
+
+    (void)esp_timer_stop(max_listen_timer_handle_);
+    esp_err_t err = esp_timer_start_once(max_listen_timer_handle_,
+                                         static_cast<uint64_t>(timeout_ms) * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Max listen timer start failed: %d", static_cast<int>(err));
+    }
+#else
+    (void)timeout_ms;
+#endif
+}
+
 void Application::BeginSpeechEndDetection() {
 #if CONFIG_OYE_SPEECH_END_DETECTION
     if (listening_mode_ != kListeningModeAutoStop) {
@@ -1324,10 +1449,15 @@ void Application::BeginSpeechEndDetection() {
     pcm_level_speaking_.store(false);
     speech_activity_speaking_.store(afe_vad_speaking_.load());
 
-    ESP_LOGI(TAG, "Speech end detection armed: silence=%dms pcm_level=%d no_speech=%dms",
+    ESP_LOGI(TAG, "Speech end detection armed: silence=%dms pcm_level=%d no_speech=%dms max_listen=%dms",
              CONFIG_OYE_SPEECH_END_SILENCE_MS,
              CONFIG_OYE_SPEECH_END_PCM_LEVEL_THRESHOLD,
-             CONFIG_OYE_SPEECH_END_NO_SPEECH_TIMEOUT_MS);
+             CONFIG_OYE_SPEECH_END_NO_SPEECH_TIMEOUT_MS,
+             CONFIG_OYE_SPEECH_END_MAX_LISTEN_MS);
+
+#if CONFIG_OYE_SPEECH_END_MAX_LISTEN_MS > 0
+    ArmMaxListenTimer(CONFIG_OYE_SPEECH_END_MAX_LISTEN_MS);
+#endif
 
     if (speech_activity_speaking_.load()) {
         speech_started_ = true;
@@ -1345,6 +1475,9 @@ void Application::ResetSpeechEndDetection() {
 #if CONFIG_OYE_SPEECH_END_DETECTION
     if (speech_end_timer_handle_ != nullptr) {
         (void)esp_timer_stop(speech_end_timer_handle_);
+    }
+    if (max_listen_timer_handle_ != nullptr) {
+        (void)esp_timer_stop(max_listen_timer_handle_);
     }
     speech_started_ = false;
     speech_end_waiting_ = false;
@@ -1488,6 +1621,21 @@ void Application::HandleSpeechEndDetectedEvent() {
         return;
     }
 
+    speech_end_waiting_ = false;
+    if (protocol_) {
+        protocol_->SendStopListening();
+    }
+    SetDeviceState(kDeviceStateIdle);
+#endif
+}
+
+void Application::HandleMaxListenTimeoutEvent() {
+#if CONFIG_OYE_SPEECH_END_DETECTION
+    if (GetDeviceState() != kDeviceStateListening || listening_mode_ != kListeningModeAutoStop) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Speech end detection: max listen timeout, auto StopListening");
     speech_end_waiting_ = false;
     if (protocol_) {
         protocol_->SendStopListening();

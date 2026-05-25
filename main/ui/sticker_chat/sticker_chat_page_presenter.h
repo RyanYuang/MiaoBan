@@ -11,7 +11,8 @@ namespace ui::sticker_chat {
 
 /**
  * 贴图对话页：返回仅出栈；点击 Chat_btn 只 ToggleChatState（不关闭叠页）。
- * 底部提示文案随状态机更新（如 listening→idle 恢复「点击按钮…」）。
+ * 底部提示文案随状态机更新；结束收音后先显示「等待识别结果…」，
+ * 只有收到后端 llm_start 时才切到「正在思考…」。
  */
 class StickerChatPagePresenter final : public ui::mvp::LvglPageTouchPresenter {
 public:
@@ -26,6 +27,8 @@ public:
 private:
     void OnDeviceState(DeviceState old_state, DeviceState new_state);
     void OnRecognitionText(const std::string& text);
+    void OnAssistantText(const std::string& text);
+    void OnChatStatus(const std::string& text);
 
     Display* display_ = nullptr;
     bool* page_alive_ = nullptr;
@@ -33,6 +36,8 @@ private:
     void* transcript_label_ = nullptr;
     int listener_id_ = -1;
     int recognition_listener_id_ = -1;
+    int assistant_listener_id_ = -1;
+    int chat_status_listener_id_ = -1;
 };
 
 }  // namespace ui::sticker_chat

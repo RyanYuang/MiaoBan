@@ -35,6 +35,7 @@
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
 #define MAIN_EVENT_SPEECH_END_DETECTED  (1 << 13)
+#define MAIN_EVENT_MAX_LISTEN_TIMEOUT   (1 << 14)
 
 
 enum AecMode {
@@ -57,6 +58,8 @@ enum class SpeechActivitySource : uint8_t {
 class Application {
 public:
     using RecognitionTextCallback = std::function<void(const std::string& text)>;
+    using AssistantTextCallback = std::function<void(const std::string& text)>;
+    using ChatStatusCallback = std::function<void(const std::string& text)>;
 
     static Application& GetInstance() {
         static Application instance;
@@ -88,6 +91,10 @@ public:
     void RemoveDeviceStateChangeListener(int listener_id);
     int AddRecognitionTextListener(RecognitionTextCallback callback);
     void RemoveRecognitionTextListener(int listener_id);
+    int AddAssistantTextListener(AssistantTextCallback callback);
+    void RemoveAssistantTextListener(int listener_id);
+    int AddChatStatusListener(ChatStatusCallback callback);
+    void RemoveChatStatusListener(int listener_id);
 
     /**
      * Request state transition
@@ -156,6 +163,7 @@ private:
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
     esp_timer_handle_t speech_end_timer_handle_ = nullptr;
+    esp_timer_handle_t max_listen_timer_handle_ = nullptr;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -172,6 +180,12 @@ private:
     std::mutex recognition_text_listeners_mutex_;
     std::vector<std::pair<int, RecognitionTextCallback>> recognition_text_listeners_;
     int next_recognition_text_listener_id_ = 0;
+    std::mutex assistant_text_listeners_mutex_;
+    std::vector<std::pair<int, AssistantTextCallback>> assistant_text_listeners_;
+    int next_assistant_text_listener_id_ = 0;
+    std::mutex chat_status_listeners_mutex_;
+    std::vector<std::pair<int, ChatStatusCallback>> chat_status_listeners_;
+    int next_chat_status_listener_id_ = 0;
     std::atomic<bool> afe_vad_speaking_{false};
     std::atomic<bool> pcm_level_speaking_{false};
     std::atomic<bool> speech_activity_speaking_{false};
@@ -196,6 +210,7 @@ private:
     void HandleWakeWordDetectedEvent();
     void HandleVadChangeEvent();
     void HandleSpeechEndDetectedEvent();
+    void HandleMaxListenTimeoutEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
 
@@ -207,12 +222,15 @@ private:
     void CheckNewVersion();
     void InitializeProtocol();
     void NotifyRecognitionTextListeners(const std::string& text);
+    void NotifyAssistantTextListeners(const std::string& text);
+    void NotifyChatStatusListeners(const std::string& text);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
     void BeginSpeechEndDetection();
     void ResetSpeechEndDetection();
     void ArmSpeechEndTimer(SpeechEndTimerReason reason, uint32_t timeout_ms);
+    void ArmMaxListenTimer(uint32_t timeout_ms);
     void UpdateSpeechActivity(SpeechActivitySource source, bool speaking);
     
     // State change handler called by state machine
