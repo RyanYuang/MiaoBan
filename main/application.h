@@ -12,6 +12,7 @@
 #include <memory>
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 #include "protocol.h"
 #include "ota.h"
@@ -55,6 +56,8 @@ enum class SpeechActivitySource : uint8_t {
 
 class Application {
 public:
+    using RecognitionTextCallback = std::function<void(const std::string& text)>;
+
     static Application& GetInstance() {
         static Application instance;
         return instance;
@@ -83,6 +86,8 @@ public:
     /** 订阅设备状态迁移（回调在 `TransitionTo` 调用方上下文中同步触发；改 UI 请投递到 ui_cmd）。 */
     int AddDeviceStateChangeListener(DeviceStateMachine::StateCallback callback);
     void RemoveDeviceStateChangeListener(int listener_id);
+    int AddRecognitionTextListener(RecognitionTextCallback callback);
+    void RemoveRecognitionTextListener(int listener_id);
 
     /**
      * Request state transition
@@ -164,6 +169,9 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    std::mutex recognition_text_listeners_mutex_;
+    std::vector<std::pair<int, RecognitionTextCallback>> recognition_text_listeners_;
+    int next_recognition_text_listener_id_ = 0;
     std::atomic<bool> afe_vad_speaking_{false};
     std::atomic<bool> pcm_level_speaking_{false};
     std::atomic<bool> speech_activity_speaking_{false};
@@ -198,6 +206,7 @@ private:
     void CheckAssetsVersion();
     void CheckNewVersion();
     void InitializeProtocol();
+    void NotifyRecognitionTextListeners(const std::string& text);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;

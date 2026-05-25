@@ -15,6 +15,7 @@
 #include "ui_command_dispatcher.h"
 #include "ui_page_router.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <esp_log.h>
@@ -197,6 +198,23 @@ int Application::AddDeviceStateChangeListener(DeviceStateMachine::StateCallback 
 void Application::RemoveDeviceStateChangeListener(int listener_id)
 {
     state_machine_.RemoveStateChangeListener(listener_id);
+}
+
+int Application::AddRecognitionTextListener(RecognitionTextCallback callback)
+{
+    std::lock_guard<std::mutex> lock(recognition_text_listeners_mutex_);
+    const int id = next_recognition_text_listener_id_++;
+    recognition_text_listeners_.emplace_back(id, std::move(callback));
+    return id;
+}
+
+void Application::RemoveRecognitionTextListener(int listener_id)
+{
+    std::lock_guard<std::mutex> lock(recognition_text_listeners_mutex_);
+    recognition_text_listeners_.erase(
+        std::remove_if(recognition_text_listeners_.begin(), recognition_text_listeners_.end(),
+            [listener_id](const auto& entry) { return entry.first == listener_id; }),
+        recognition_text_listeners_.end());
 }
 
 /**
@@ -800,8 +818,9 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                UiCommandDispatcher::Instance().Post([display, message = std::string(text->valuestring)]() {
+                UiCommandDispatcher::Instance().Post([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
+                    NotifyRecognitionTextListeners(message);
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -1018,6 +1037,25 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     }
 
     SetListeningMode(mode);
+}
+
+void Application::NotifyRecognitionTextListeners(const std::string& text)
+{
+    std::vector<RecognitionTextCallback> callbacks_copy;
+    {
+        std::lock_guard<std::mutex> lock(recognition_text_listeners_mutex_);
+        callbacks_copy.reserve(recognition_text_listeners_.size());
+        for (const auto& [id, callback] : recognition_text_listeners_) {
+            (void)id;
+            callbacks_copy.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : callbacks_copy) {
+        if (callback != nullptr) {
+            callback(text);
+        }
+    }
 }
 
 /**

@@ -127,6 +127,15 @@ void LvglStickerChatPageView::BuildLayout()
     lv_obj_set_style_text_opa(hint, LV_OPA_70, 0);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -32);
 
+    lv_obj_t* transcript = lv_label_create(panel);
+    lv_label_set_text(transcript, "");
+    lv_obj_set_width(transcript, LV_PCT(84));
+    lv_label_set_long_mode(transcript, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(transcript, theme_->text_font()->font(), 0);
+    lv_obj_set_style_text_color(transcript, theme_->text_color(), 0);
+    lv_obj_set_style_text_align(transcript, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(transcript, LV_ALIGN_BOTTOM_MID, 0, -76);
+
     if (Assets::GetInstance().partition_valid()) {
         void* asset_ptr = nullptr;
         size_t asset_size = 0;
@@ -156,7 +165,7 @@ void LvglStickerChatPageView::BuildLayout()
     }
 
     if (touch_presenter_ != nullptr && page_alive_ != nullptr) {
-        touch_presenter_->AttachStateHints(display_, page_alive_, hint);
+        touch_presenter_->AttachStateUi(display_, page_alive_, hint, transcript);
     }
 
     if (touch_presenter_ != nullptr) {

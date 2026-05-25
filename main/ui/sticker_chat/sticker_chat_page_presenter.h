@@ -3,6 +3,8 @@
 #include "device_state.h"
 #include "lvgl_page_touch_presenter.h"
 
+#include <string>
+
 class Display;
 
 namespace ui::sticker_chat {
@@ -19,15 +21,18 @@ public:
     void OnClick(lv_event_t* e) override;
 
     /** 在 BuildLayout 末尾调用：`page_alive` 在根 DELETE 前置 false，避免异步改已删控件。 */
-    void AttachStateHints(Display* display, bool* page_alive, void* hint_label);
+    void AttachStateUi(Display* display, bool* page_alive, void* hint_label, void* transcript_label);
 
 private:
     void OnDeviceState(DeviceState old_state, DeviceState new_state);
+    void OnRecognitionText(const std::string& text);
 
     Display* display_ = nullptr;
     bool* page_alive_ = nullptr;
     void* hint_label_ = nullptr;
+    void* transcript_label_ = nullptr;
     int listener_id_ = -1;
+    int recognition_listener_id_ = -1;
 };
 
 }  // namespace ui::sticker_chat
