@@ -112,6 +112,7 @@ public:
      */
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
+    void UpdateRoundEndingIntentFromUserText(const std::string& text);
 
     void AbortSpeaking(AbortReason reason);
 #if CONFIG_OYE_SPEECH_END_DETECTION
@@ -145,6 +146,7 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    void OnVoiceResultPendingCleared();
     
     /**
      * Reset protocol resources (thread-safe)
@@ -175,6 +177,8 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    DeviceState deferred_tts_stop_state_ = kDeviceStateUnknown;
+    bool end_conversation_after_round_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
     std::mutex recognition_text_listeners_mutex_;
@@ -225,6 +229,10 @@ private:
     void NotifyAssistantTextListeners(const std::string& text);
     void NotifyChatStatusListeners(const std::string& text);
     void ShowActivationCode(const std::string& code, const std::string& message);
+    bool IsAwaitingVoiceResult() const;
+    bool ShouldBlockConversationStart(const char* source, bool revert_to_idle = false);
+    void ApplyIdleState(bool preserve_chat);
+    void ApplyListeningState();
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
     void BeginSpeechEndDetection();

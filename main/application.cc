@@ -855,16 +855,22 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    deferred_tts_stop_state_ = kDeviceStateUnknown;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
-                        } else {
-                            SetDeviceState(kDeviceStateListening);
+                        const DeviceState target_state =
+                            listening_mode_ == kListeningModeManualStop ? kDeviceStateIdle
+                                                                        : kDeviceStateListening;
+                        if (IsAwaitingVoiceResult()) {
+                            deferred_tts_stop_state_ = target_state;
+                            ESP_LOGI(TAG, "TTS stop: defer state transition to %s until playback drains",
+                                     DeviceStateMachine::GetStateName(target_state));
+                            return;
                         }
+                        SetDeviceState(target_state);
                     }
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
@@ -1014,6 +1020,88 @@ void Application::DismissAlert() {
     }
 }
 
+bool Application::IsAwaitingVoiceResult() const {
+    return protocol_ != nullptr && protocol_->IsVoiceResultPending();
+}
+
+bool Application::ShouldBlockConversationStart(const char* source, bool revert_to_idle) {
+    if (!IsAwaitingVoiceResult()) {
+        return false;
+    }
+
+    ESP_LOGW(TAG, "%s blocked: awaiting previous voice result", source);
+    if (revert_to_idle && GetDeviceState() == kDeviceStateConnecting) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+    return true;
+}
+
+void Application::ApplyIdleState(bool preserve_chat) {
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetStatus(Lang::Strings::STANDBY);
+    if (!preserve_chat) {
+        display->ClearChatMessages();
+    }
+    display->SetEmotion("neutral");
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(!preserve_chat);
+}
+
+void Application::ApplyListeningState() {
+    if (!protocol_) {
+        ESP_LOGW(TAG, "ApplyListeningState skipped: protocol not initialized");
+        return;
+    }
+
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetStatus(Lang::Strings::LISTENING);
+    display->SetEmotion("neutral");
+
+    if (listening_mode_ == kListeningModeAutoStop) {
+        audio_service_.WaitForPlaybackQueueEmpty();
+    }
+    protocol_->SendStartListening(listening_mode_);
+
+#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#else
+    audio_service_.EnableWakeWordDetection(false);
+#endif
+
+    if (play_popup_on_listening_) {
+        play_popup_on_listening_ = false;
+        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+    }
+    BeginSpeechEndDetection();
+}
+
+void Application::OnVoiceResultPendingCleared() {
+    if (IsAwaitingVoiceResult()) {
+        return;
+    }
+
+    if (deferred_tts_stop_state_ != kDeviceStateUnknown) {
+        const DeviceState target_state = deferred_tts_stop_state_;
+        deferred_tts_stop_state_ = kDeviceStateUnknown;
+        if (GetDeviceState() == kDeviceStateSpeaking) {
+            ESP_LOGI(TAG, "Voice result pending cleared: apply deferred state %s",
+                     DeviceStateMachine::GetStateName(target_state));
+            SetDeviceState(target_state);
+            return;
+        }
+    }
+
+    const auto state = GetDeviceState();
+    if (state == kDeviceStateListening) {
+        ESP_LOGI(TAG, "Voice result pending cleared: resume deferred listening");
+        ApplyListeningState();
+    } else if (state == kDeviceStateIdle) {
+        ESP_LOGI(TAG, "Voice result pending cleared: restore idle readiness");
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(true);
+    }
+}
+
 /**
  * 线程安全地请求切换对话状态：向主循环投递 MAIN_EVENT_TOGGLE_CHAT。
  */
@@ -1067,6 +1155,9 @@ void Application::HandleToggleChatEvent() {
     }
 
     if (state == kDeviceStateIdle) {
+        if (ShouldBlockConversationStart("ToggleChatState")) {
+            return;
+        }
         // 待机 → 开始一轮对话：先建音频通道，再按默认模式进入聆听
         ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
@@ -1097,6 +1188,10 @@ void Application::HandleToggleChatEvent() {
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
+        return;
+    }
+
+    if (ShouldBlockConversationStart("ContinueOpenAudioChannel", true)) {
         return;
     }
 
@@ -1192,6 +1287,9 @@ void Application::HandleStartListeningEvent() {
 #endif
     
     if (state == kDeviceStateIdle) {
+        if (ShouldBlockConversationStart("HandleStartListeningEvent")) {
+            return;
+        }
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -1238,6 +1336,9 @@ void Application::HandleWakeWordDetectedEvent() {
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
     if (state == kDeviceStateIdle) {
+        if (ShouldBlockConversationStart("HandleWakeWordDetectedEvent")) {
+            return;
+        }
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
 
@@ -1281,6 +1382,10 @@ void Application::HandleWakeWordDetectedEvent() {
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
+        return;
+    }
+
+    if (ShouldBlockConversationStart("ContinueWakeWordInvoke", true)) {
         return;
     }
 
@@ -1336,12 +1441,7 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
-            display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();  // 先清空消息
-            display->SetEmotion("neutral"); // 再设表情（微信模式会检查子节点数量）
-            // 完全待机：不上传语音处理；重新允许唤醒词。
-            audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            ApplyIdleState(IsAwaitingVoiceResult());
             break;
         case kDeviceStateConnecting:
             // 建立音频通道/会话期间的简要界面。
@@ -1350,30 +1450,13 @@ void Application::HandleStateChangedEvent() {
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
-            display->SetStatus(Lang::Strings::LISTENING);
-            display->SetEmotion("neutral");
-
-            // 自动停止模式：先等播放队列为空再开麦，避免截断 TTS。
-            if (listening_mode_ == kListeningModeAutoStop) {
-                audio_service_.WaitForPlaybackQueueEmpty();
+            if (IsAwaitingVoiceResult()) {
+                ESP_LOGI(TAG, "Listening state entry deferred: awaiting previous voice result");
+                display->SetStatus(Lang::Strings::LISTENING);
+                display->SetEmotion("neutral");
+                break;
             }
-            // 先建 WS 再开麦（见 OyeChatProtocol::SendStartListening），避免握手期间堆 PCM 占满内存。
-            protocol_->SendStartListening(listening_mode_);
-
-#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
-            // 在聆听模式下启用唤醒词检测（由 Kconfig 配置）
-            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
-#else
-            // 在聆听模式下关闭唤醒词检测
-            audio_service_.EnableWakeWordDetection(false);
-#endif
-            
-            // 在 EnableVoiceProcessing 内已调用 ResetDecoder 之后再播放提示音
-            if (play_popup_on_listening_) {
-                play_popup_on_listening_ = false;
-                audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
-            }
-            BeginSpeechEndDetection();
+            ApplyListeningState();
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1776,6 +1859,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     auto state = GetDeviceState();
     
     if (state == kDeviceStateIdle) {
+        if (ShouldBlockConversationStart("WakeWordInvoke")) {
+            return;
+        }
         audio_service_.EncodeWakeWord();
 
         if (!protocol_->IsAudioChannelOpened()) {

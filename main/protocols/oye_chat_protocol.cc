@@ -120,6 +120,10 @@ bool OyeChatProtocol::IsAudioChannelOpened() const {
     return channel_open_ && !error_occurred_;
 }
 
+bool OyeChatProtocol::IsVoiceResultPending() const {
+    return processing_.load();
+}
+
 bool OyeChatProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     (void)packet;
     return true;
@@ -320,11 +324,11 @@ void OyeChatProtocol::SendStopListening() {
     Application::GetInstance().GetAudioService().ClearPcmTap();
     {
         std::lock_guard<std::mutex> lock(worker_mutex_);
-        if (processing_) {
+        if (processing_.load()) {
             ESP_LOGW(TAG, "[voice-chat] utterance worker already running");
             return;
         }
-        processing_ = true;
+        processing_.store(true);
     }
     ESP_LOGI(TAG, "[voice-chat] spawn utterance worker (end -> voice_chat_done)");
     xTaskCreate(ProcessUtteranceEntry, "oye_chat", 12288, this, 5, &worker_);
@@ -346,12 +350,15 @@ void OyeChatProtocol::ProcessUtteranceTask(void* arg) {
         ESP_LOGI(TAG, "[pipeline] aborted by user");
     }
 
-    processing_ = false;
+    processing_.store(false);
     worker_ = nullptr;
     last_incoming_time_ = std::chrono::steady_clock::now();
-    auto& audio = Application::GetInstance().GetAudioService();
-    if (Application::GetInstance().GetDeviceState() == kDeviceStateListening) {
-        audio.EnableWakeWordDetection(audio.IsAfeWakeWord());
+    if (schedule_) {
+        schedule_([]() {
+            Application::GetInstance().OnVoiceResultPendingCleared();
+        });
+    } else {
+        ESP_LOGW(TAG, "[pipeline] schedule_ null, skip pending-cleared follow-up");
     }
     ESP_LOGI(TAG, "[pipeline] utterance worker finished");
     vTaskDelete(nullptr);

@@ -16,12 +16,17 @@ if [[ ! -f "${PATCH_FILE}" ]]; then
 fi
 
 cd "${COMPONENT_DIR}"
-if patch -R -p0 --dry-run -s < "${PATCH_FILE}" 2>/dev/null; then
+
+# The dependency is freshly downloaded into managed_components/, so the safest
+# idempotence check is to look for the features introduced by our local patch.
+if grep -q "void ShutdownTransport();" include/web_socket.h \
+    && grep -q "Reply Pong:" src/web_socket.cc \
+    && grep -q "kTcpReceiveTaskStackBytes" src/esp/esp_tcp.cc; then
     exit 0
 fi
 
-if patch -p0 --dry-run -s < "${PATCH_FILE}" 2>/dev/null; then
-    patch -p0 < "${PATCH_FILE}"
+if patch --forward -p0 --dry-run -s < "${PATCH_FILE}" 2>/dev/null; then
+    patch --forward -p0 < "${PATCH_FILE}"
     echo "apply_esp_ml307_patches: applied voice-chat-tcp-websocket.patch"
     exit 0
 fi

@@ -34,6 +34,7 @@ public:
     void SendStartListening(ListeningMode mode) override;
     void SendStopListening() override;
     void SendAbortSpeaking(AbortReason reason) override;
+    bool IsVoiceResultPending() const override;
 
 protected:
     bool SendText(const std::string& text) override;
@@ -45,7 +46,7 @@ private:
     oye::VoiceChatStream* voice_chat_stream_ = nullptr;
     TaskHandle_t worker_ = nullptr;
     std::mutex worker_mutex_;
-    bool processing_ = false;
+    std::atomic<bool> processing_{false};
     std::atomic<bool> speak_abort_{false};
     std::atomic<bool> pcm_tap_first_feed_logged_{false};
     bool user_check_ok_ = false;
