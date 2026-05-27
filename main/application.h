@@ -55,7 +55,12 @@ enum class SpeechActivitySource : uint8_t {
     kPcmLevel,
 };
 
+namespace ui::meeting {
+class MeetingPagePresenter;
+}
+
 class Application {
+    friend class ui::meeting::MeetingPagePresenter;
 public:
     using RecognitionTextCallback = std::function<void(const std::string& text)>;
     using AssistantTextCallback = std::function<void(const std::string& text)>;

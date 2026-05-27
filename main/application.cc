@@ -784,19 +784,26 @@ void Application::CheckNewVersion() {
  * Oye 固件：仅 OyeChatProtocol（会议 WS ASR + HTTP 对话）；否则为小智 MQTT/WebSocket。
  */
 void Application::InitializeProtocol() {
+    // 获取板子实例
     auto& board = Board::GetInstance();
+    // 获取显示实例
     auto display = board.GetDisplay();
+    // 获取音频编码实例
     auto codec = board.GetAudioCodec();
-
+    // 设置状态栏为加载协议
     UiCommandDispatcher::Instance().Post([display]() {
         display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
     });
 
 #if CONFIG_USE_OYE_CLOUD_API
     {
+        // 创建Chat协议实例
         auto oye_proto = std::make_unique<OyeChatProtocol>();
+        // 设置主调度器
         oye_proto->SetMainScheduler([this](std::function<void()> fn) { Schedule(std::move(fn)); });
+        // 设置协议实例
         protocol_ = std::move(oye_proto);
+        // 打印日志
         ESP_LOGI(TAG, "Voice protocol: Oye cloud (Xiaozhi MQTT/WS disabled)");
         if (!oye::HasAccessToken()) {
             ESP_LOGW(TAG, "No access_token yet; bind via BLE SET_USER_TOKEN before chat");
@@ -812,24 +819,27 @@ void Application::InitializeProtocol() {
         protocol_ = std::make_unique<MqttProtocol>();
     }
 #endif
-
+    // 设置协议连接回调
     protocol_->OnConnected([this]() {
         UiCommandDispatcher::Instance().Post([this]() {
             DismissAlert();
         });
     });
 
+    // 设置协议网络错误回调
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     
+    // 设置协议音频回调
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
     
+    // 设置协议音频通道打开回调
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
@@ -837,7 +847,7 @@ void Application::InitializeProtocol() {
                 protocol_->server_sample_rate(), codec->output_sample_rate());
         }
     });
-    
+    // 设置协议音频通道关闭回调
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         UiCommandDispatcher::Instance().Post([this]() {
@@ -847,6 +857,7 @@ void Application::InitializeProtocol() {
         });
     });
     
+    // 设置协议JSON回调
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
@@ -956,6 +967,7 @@ void Application::InitializeProtocol() {
         }
     });
     
+    // 启动协议
     protocol_->Start();
 }
 

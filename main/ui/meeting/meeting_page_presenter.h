@@ -40,6 +40,8 @@ private:
     static void RefreshListTask(MeetingPagePresenter* self);
     static void LoadDetailTask(MeetingPagePresenter* self);
     static void UploadTask(MeetingPagePresenter* self);
+    static void MeetingTask(MeetingPagePresenter* self);
+    static void InitializeProtocol();
 
     IMeetingPageView* view_;
     Display* display_ = nullptr;

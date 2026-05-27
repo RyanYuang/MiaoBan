@@ -17,9 +17,19 @@
 #include <new>
 
 #if CONFIG_USE_OYE_CLOUD_API
+#include "application.h"
+#include "assets/lang_config.h"
+#include "audio_codec.h"
+#include "board.h"
+#include "device_state_machine.h"
+#include "mcp_server.h"
 #include "oye/oye_audio_util.h"
 #include "oye/oye_cloud_api.h"
 #include "oye/oye_config.h"
+#include "protocols/oye_metting_protocol.h"
+
+#include <cJSON.h>
+#include <cstring>
 #endif
 
 namespace ui::meeting {
@@ -257,7 +267,7 @@ void MeetingPagePresenter::StartRecordAndUpload() {
     model_.loading = true;
     model_.status_line = "录音中…";
     Show(model_);
-    RunNetworkTask(UploadTask);
+    RunNetworkTask(MeetingTask);
 }
 
 void MeetingPagePresenter::NotifyTaskFailed(const char* status_line) {
@@ -508,6 +518,201 @@ void MeetingPagePresenter::UploadTask(MeetingPagePresenter* self) {
     });
 #else
     (void)self;
+#endif
+}
+
+void MeetingPagePresenter::MeetingTask(MeetingPagePresenter* self) {
+#if CONFIG_USE_OYE_CLOUD_API
+    (void)self;
+    ESP_LOGI(TAG, "MeetingTask: begin");
+    InitializeProtocol();
+    ESP_LOGI(TAG, "MeetingTask: end");
+#else
+    (void)self;
+#endif
+}
+
+/**
+ * 创建会议语音协议实例并注册回调（安装到 Application::protocol_）。
+ * Oye 固件：OyeMettingProtocol（/mcu/voice-chat/ws）。
+ */
+void MeetingPagePresenter::InitializeProtocol() {
+#if !CONFIG_USE_OYE_CLOUD_API
+    ESP_LOGW(TAG, "InitializeProtocol: Oye cloud API disabled");
+    return;
+#else
+    Application& app = Application::GetInstance();
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+    auto codec = board.GetAudioCodec();
+
+    UiCommandDispatcher::Instance().Post([display]() {
+        display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+    });
+
+    {
+        auto oye_proto = std::make_unique<OyeMettingProtocol>();
+        oye_proto->SetMainScheduler([&app](std::function<void()> fn) { app.Schedule(std::move(fn)); });
+        app.protocol_ = std::move(oye_proto);
+        ESP_LOGI(TAG, "Voice protocol: OyeMettingProtocol (meeting voice-chat)");
+        if (!oye::HasAccessToken()) {
+            ESP_LOGW(TAG, "No access_token yet; bind via BLE SET_USER_TOKEN before meeting voice");
+        }
+    }
+
+    app.protocol_->OnConnected([&app]() {
+        UiCommandDispatcher::Instance().Post([&app]() {
+            app.DismissAlert();
+        });
+    });
+
+    app.protocol_->OnNetworkError([&app](const std::string& message) {
+        app.last_error_message_ = message;
+        xEventGroupSetBits(app.event_group_, MAIN_EVENT_ERROR);
+    });
+
+    app.protocol_->OnIncomingAudio([&app](std::unique_ptr<AudioStreamPacket> packet) {
+        if (app.GetDeviceState() == kDeviceStateSpeaking) {
+            app.audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        }
+    });
+
+    app.protocol_->OnAudioChannelOpened([&app, codec, &board]() {
+        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        if (app.protocol_->server_sample_rate() != codec->output_sample_rate()) {
+            ESP_LOGW(TAG,
+                     "Server sample rate %d does not match device output sample rate %d, resampling may cause "
+                     "distortion",
+                     app.protocol_->server_sample_rate(), codec->output_sample_rate());
+        }
+    });
+
+    app.protocol_->OnAudioChannelClosed([&app, &board]() {
+        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        UiCommandDispatcher::Instance().Post([&app]() {
+            auto meeting_display = Board::GetInstance().GetDisplay();
+            meeting_display->SetChatMessage("system", "");
+            app.SetDeviceState(kDeviceStateIdle);
+        });
+    });
+
+    app.protocol_->OnIncomingJson([&app, display](const cJSON* root) {
+        auto type = cJSON_GetObjectItem(root, "type");
+        if (type == nullptr || !cJSON_IsString(type)) {
+            ESP_LOGW(TAG, "Incoming JSON missing type");
+            return;
+        }
+        if (strcmp(type->valuestring, "tts") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (state == nullptr || !cJSON_IsString(state)) {
+                return;
+            }
+            if (strcmp(state->valuestring, "start") == 0) {
+                app.Schedule([&app]() {
+                    app.aborted_ = false;
+                    app.deferred_tts_stop_state_ = kDeviceStateUnknown;
+                    app.SetDeviceState(kDeviceStateSpeaking);
+                });
+            } else if (strcmp(state->valuestring, "stop") == 0) {
+                app.Schedule([&app]() {
+                    if (app.GetDeviceState() == kDeviceStateSpeaking) {
+                        const DeviceState target_state = app.listening_mode_ == kListeningModeManualStop
+                                                             ? kDeviceStateIdle
+                                                             : kDeviceStateListening;
+                        if (app.IsAwaitingVoiceResult()) {
+                            app.deferred_tts_stop_state_ = target_state;
+                            ESP_LOGI(TAG, "TTS stop: defer state transition to %s until playback drains",
+                                     DeviceStateMachine::GetStateName(target_state));
+                            return;
+                        }
+                        app.SetDeviceState(target_state);
+                    }
+                });
+            } else if (strcmp(state->valuestring, "sentence_start") == 0) {
+                auto text = cJSON_GetObjectItem(root, "text");
+                if (cJSON_IsString(text)) {
+                    ESP_LOGI(TAG, "<< %s", text->valuestring);
+                    UiCommandDispatcher::Instance().Post([&app, display, message = std::string(text->valuestring)]() {
+                        display->SetChatMessage("assistant", message.c_str());
+                        app.NotifyAssistantTextListeners(message);
+                    });
+                }
+            }
+        } else if (strcmp(type->valuestring, "stt") == 0) {
+            auto text = cJSON_GetObjectItem(root, "text");
+            if (cJSON_IsString(text)) {
+                ESP_LOGI(TAG, ">> %s", text->valuestring);
+                UiCommandDispatcher::Instance().Post([&app, display, message = std::string(text->valuestring)]() {
+                    display->SetChatMessage("user", message.c_str());
+                    app.NotifyRecognitionTextListeners(message);
+                });
+            }
+        } else if (strcmp(type->valuestring, "chat_stage") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (cJSON_IsString(state) && strcmp(state->valuestring, "thinking") == 0) {
+                UiCommandDispatcher::Instance().Post([&app]() {
+                    app.NotifyChatStatusListeners("ASR 已结束，正在思考…");
+                });
+            }
+        } else if (strcmp(type->valuestring, "llm") == 0) {
+            auto emotion = cJSON_GetObjectItem(root, "emotion");
+            if (cJSON_IsString(emotion)) {
+                UiCommandDispatcher::Instance().Post(
+                    [display, emotion_str = std::string(emotion->valuestring)]() {
+                        display->SetEmotion(emotion_str.c_str());
+                    });
+            }
+        } else if (strcmp(type->valuestring, "mcp") == 0) {
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            if (cJSON_IsObject(payload)) {
+                McpServer::GetInstance().ParseMessage(payload);
+            }
+        } else if (strcmp(type->valuestring, "system") == 0) {
+            auto command = cJSON_GetObjectItem(root, "command");
+            if (cJSON_IsString(command)) {
+                ESP_LOGI(TAG, "System command: %s", command->valuestring);
+                if (strcmp(command->valuestring, "reboot") == 0) {
+                    app.Schedule([&app]() {
+                        app.Reboot();
+                    });
+                } else {
+                    ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
+                }
+            }
+        } else if (strcmp(type->valuestring, "alert") == 0) {
+            auto status = cJSON_GetObjectItem(root, "status");
+            auto message = cJSON_GetObjectItem(root, "message");
+            auto emotion = cJSON_GetObjectItem(root, "emotion");
+            if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
+                std::string s_status(status->valuestring);
+                std::string s_message(message->valuestring);
+                std::string s_emotion(emotion->valuestring);
+                UiCommandDispatcher::Instance().Post([&app, s_status = std::move(s_status), s_message = std::move(s_message),
+                                                      s_emotion = std::move(s_emotion)]() {
+                    app.Alert(s_status.c_str(), s_message.c_str(), s_emotion.c_str(), Lang::Sounds::OGG_VIBRATION);
+                });
+            } else {
+                ESP_LOGW(TAG, "Alert command requires status, message and emotion");
+            }
+#if CONFIG_RECEIVE_CUSTOM_MESSAGE
+        } else if (strcmp(type->valuestring, "custom") == 0) {
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            ESP_LOGI(TAG, "Received custom message: %s", cJSON_PrintUnformatted(root));
+            if (cJSON_IsObject(payload)) {
+                UiCommandDispatcher::Instance().Post(
+                    [display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
+                        display->SetChatMessage("system", payload_str.c_str());
+                    });
+            } else {
+                ESP_LOGW(TAG, "Invalid custom message format: missing payload");
+            }
+#endif
+        } else {
+            ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
+        }
+    });
+
+    app.protocol_->Start();
 #endif
 }
 

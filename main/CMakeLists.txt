@@ -884,6 +884,7 @@ if(CONFIG_USE_OYE_CLOUD_API)
         "oye/oye_audio_util.cc"
         "oye/oye_mcp_tools.cc"
         "protocols/oye_chat_protocol.cc"
+        "protocols/oye_metting_protocol.cc"
     )
     list(APPEND INCLUDE_DIRS "oye")
 endif()
