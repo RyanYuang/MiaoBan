@@ -29,6 +29,7 @@ constexpr int kWsRetryDelayMs = 400;
 constexpr uint32_t kSendTaskStackBytes = 6144;
 constexpr uint32_t kSendTaskStackBytesInternalFallback = 2560;
 constexpr UBaseType_t kSendTaskPriority = 5;
+constexpr int kPcmSendPaceMs = 20;
 constexpr int kPcmSendRetryDelayMs = 20;
 constexpr int kPcmSendRetryMaxAttempts = 250;
 
@@ -173,23 +174,31 @@ void VoiceChatStream::StopSendTask() {
     if (send_task_handle_ == nullptr) {
         return;
     }
-    xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, pdMS_TO_TICKS(3000));
+    const EventBits_t bits =
+        xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, pdMS_TO_TICKS(6000));
+    if ((bits & kSendTaskExitBit) == 0) {
+        ESP_LOGW(TAG, "StopSendTask: send task exit timeout");
+    }
     send_task_handle_ = nullptr;
 }
 
 void VoiceChatStream::PcmSendTask() {
-    // 独立发送任务：从 pcm_queue_ 取 20ms 定长帧并经 WebSocket 二进制上行。
-    // FeedPcm 只负责拼帧入队，避免在音频回调里执行 Send 阻塞采集链路。
+    // 独立发送任务：在后端 `ready` 前仅本地缓存 20ms PCM 帧，收到 `ready`
+    // 后再按实时节奏经 WebSocket 二进制上行，避免把讯飞握手窗口的背压直接施加到采集链路。
     while (send_task_run_) {
+        if (!running_ || websocket_ == nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (!stream_ready_) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         // 100ms 超时：队列空时也能周期性检查 send_task_run_，Stop 时可及时退出。
         if (xQueueReceive(pcm_queue_, send_frame_, pdMS_TO_TICKS(100)) != pdTRUE) {
             continue;
         }
-        if (!stream_ready_ || !running_ || websocket_ == nullptr) {
-            continue;
-        }
 
-        pcm_accept_feed_ = false;
         bool sent = false;
         for (int attempt = 0; send_task_run_ && stream_ready_ && running_; ++attempt) {
             if (SendPcmChunk(send_frame_, kPcmFrameSamples)) {
@@ -203,11 +212,15 @@ void VoiceChatStream::PcmSendTask() {
         }
 
         if (sent) {
-            pcm_accept_feed_ = true;
+            vTaskDelay(pdMS_TO_TICKS(kPcmSendPaceMs));
         } else {
             ESP_LOGE(TAG, "PCM send gave up after retries, halt uplink");
             stream_ready_ = false;
-            pcm_accept_feed_ = false;
+            uplink_failed_ = true;
+            if (on_error_) {
+                on_error_("语音上行连接中断，请重试");
+            }
+            SignalSessionEnd();
         }
     }
     // Stop 时不再 drain 发送，避免在已阻塞的 TCP 上继续 Send。
@@ -245,7 +258,7 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
     user_text_.clear();
     assistant_text_.clear();
     stream_ready_ = false;
-    pcm_accept_feed_ = false;
+    uplink_failed_ = false;
     session_finished_ = false;
     if (done_event_ != nullptr) {
         xEventGroupClearBits(done_event_, kDoneReceivedBit | kSendTaskExitBit);
@@ -282,7 +295,6 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
                  static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                  static_cast<unsigned>(pcm_queue_drops_));
         stream_ready_ = false;
-        pcm_accept_feed_ = false;
         running_ = false;
         send_task_run_ = false;
         SignalSessionEnd();
@@ -343,8 +355,8 @@ bool VoiceChatStream::Start(int chat_session_id, TextCallback on_asr, TextCallba
     }
 
     running_ = true;
-    stream_ready_ = true;
-    pcm_accept_feed_ = true;
+    stream_ready_ = false;
+    ESP_LOGI(TAG, "waiting for backend ready before PCM uplink");
     return true;
 }
 
@@ -398,21 +410,23 @@ bool VoiceChatStream::SendPcmChunk(const int16_t* samples, size_t count) {
 }
 
 void VoiceChatStream::FlushPcmAccumToQueue() {
-    if (!pcm_accept_feed_ || pcm_queue_ == nullptr) {
+    if (pcm_queue_ == nullptr) {
         return;
     }
     while (pcm_accum_.size() >= kPcmFrameSamples) {
         if (xQueueSend(pcm_queue_, pcm_accum_.data(), 0) != pdTRUE) {
-            pcm_accept_feed_ = false;
-            return;
+            ++pcm_queue_drops_;
+            if ((pcm_queue_drops_ % 20) == 1) {
+                ESP_LOGW(TAG, "PCM queue full, dropped frame (drops=%u)",
+                         static_cast<unsigned>(pcm_queue_drops_));
+            }
         }
         pcm_accum_.erase(pcm_accum_.begin(), pcm_accum_.begin() + kPcmFrameSamples);
     }
 }
 
 void VoiceChatStream::FeedPcm(const int16_t* samples, size_t count) {
-    if (!running_ || !stream_ready_ || !pcm_accept_feed_ || pcm_queue_ == nullptr || samples == nullptr ||
-        count == 0) {
+    if (!running_ || pcm_queue_ == nullptr || samples == nullptr || count == 0) {
         return;
     }
     pcm_accum_.insert(pcm_accum_.end(), samples, samples + count);
@@ -442,16 +456,23 @@ void VoiceChatStream::Stop(bool wait_for_done) {
     }
 
     stream_ready_ = false;
-    pcm_accept_feed_ = false;
     running_ = false;
     send_task_run_ = false;
+    StopSendTask();
+    DestroyPcmQueue();
+    pcm_accum_.clear();
+
+    if (uplink_failed_ && wait_for_done) {
+        ESP_LOGW(TAG, "Stop: uplink already failed, skip waiting for voice_chat_done");
+        wait_for_done = false;
+    }
 
     if (websocket_ != nullptr) {
         auto* socket = static_cast<WebSocket*>(websocket_);
         ESP_LOGI(TAG, "Stop: sending end (feeds=%u bytes=%u wait_done=%d)",
                  static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                  wait_for_done ? 1 : 0);
-        if (socket->IsConnected()) {
+        if (wait_for_done && socket->IsConnected()) {
             if (!socket->Send(R"({"action":"end"})")) {
                 wait_for_done = false;
             }
@@ -462,10 +483,6 @@ void VoiceChatStream::Stop(bool wait_for_done) {
             ESP_LOGI(TAG, "Stop: keep WS transport open for llm/tts/voice_chat_done");
         }
     }
-
-    StopSendTask();
-    DestroyPcmQueue();
-    pcm_accum_.clear();
 
     if (websocket_ != nullptr && wait_for_done && !session_finished_ && done_event_ != nullptr) {
         const EventBits_t bits =
@@ -502,6 +519,9 @@ void VoiceChatStream::HandleText(const char* data, size_t len) {
                 on_asr_(text->valuestring);
             }
         }
+    } else if (strcmp(t, "ready") == 0) {
+        stream_ready_ = true;
+        ESP_LOGI(TAG, "WS ready: backend upstream prepared, start PCM uplink");
     } else if (strcmp(t, "asr_final") == 0) {
         auto text = cJSON_GetObjectItem(root, "text");
         if (cJSON_IsString(text)) {

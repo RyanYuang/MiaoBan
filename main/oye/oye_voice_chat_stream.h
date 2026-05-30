@@ -40,8 +40,11 @@ private:
     /** 20ms @16kHz. Keep WS/TCP frames small enough for ESP32-S3's tight lwIP send window. */
     static constexpr size_t kPcmFrameSamples = 320;
     static constexpr size_t kPcmFrameBytes = kPcmFrameSamples * sizeof(int16_t);
-    /** 仅缓存在途 2 帧，避免 send 阻塞时队列堆满占内存。 */
-    static constexpr UBaseType_t kPcmQueueDepth = 2;
+    /**
+     * Buffer several seconds of 20ms PCM locally while the backend finishes
+     * the upstream ASR handshake, then start uplink after it sends `ready`.
+     */
+    static constexpr UBaseType_t kPcmQueueDepth = 256;
     static constexpr size_t kPcmAccumMaxSamples = kPcmFrameSamples * 3;
 
     static constexpr EventBits_t kDoneReceivedBit = BIT0;
@@ -49,8 +52,7 @@ private:
 
     bool running_ = false;
     bool stream_ready_ = false;
-    /** false 时 FeedPcm 不入 accum/队列，直至当前帧发送成功后再置 true。 */
-    volatile bool pcm_accept_feed_ = false;
+    volatile bool uplink_failed_ = false;
     bool session_finished_ = false;
     bool transport_boost_ = false;
     volatile bool send_task_run_ = false;

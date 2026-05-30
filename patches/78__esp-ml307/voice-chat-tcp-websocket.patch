@@ -7,7 +7,7 @@ diff -Naur upstream/include/web_socket.h patched/include/web_socket.h
      void Close();
 +    /** 立即断开底层 TCP，用于解除阻塞中的 send()。 */
 +    void ShutdownTransport();
- 
+
      void OnConnected(std::function<void()> callback);
      void OnDisconnected(std::function<void()> callback);
 @@ -65,6 +67,14 @@
@@ -53,12 +53,22 @@ diff -Naur upstream/src/esp/esp_tcp.cc patched/src/esp/esp_tcp.cc
 +static constexpr uint32_t kTcpReceiveTaskStackBytesInternalFallback = 8192;
 +static constexpr UBaseType_t kTcpReceiveTaskPriority = 6;
 +static constexpr int kTcpConnectTimeoutMs = 10000;
-+static constexpr int kTcpSendTimeoutMs = 5000;
++// Keep each socket-level write wait short; the voice uplink already has its own
++// retry loop, and a 5s stall here starves PCM dequeue and fills the local queue.
++static constexpr int kTcpSendTimeoutMs = 250;
++// Once part of a WebSocket frame is already on the wire, keep finishing that
++// same TCP write inside EspTcp::Send instead of bubbling the partial frame back
++// up to the WebSocket layer. Retrying a partially-sent WS frame from scratch
++// would duplicate the leading bytes and corrupt the stream.
++static constexpr int kTcpPartialSendProgressDeadlineMs = 3000;
 +static void ConfigureSocket(int fd) {
 +    int flag = 1;
 +    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 +
-+    const int sndbuf = 8192;
++    // Voice-chat PCM is sent as many small WS binary frames while the backend
++    // may still be finishing upstream ASR handshake. Give the modem socket
++    // enough send buffer to absorb that short startup backlog.
++    const int sndbuf = 65536;
 +    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 +
 +    const int flags = fcntl(fd, F_GETFL, 0);
@@ -293,10 +303,27 @@ diff -Naur upstream/src/esp/esp_tcp.cc patched/src/esp/esp_tcp.cc
 +                if (WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
 +                    continue;
 +                }
-+                last_error_ = wait_error;
-+                ESP_LOGE(TAG, "Tcp send wait failed: errno=%d sent=%u/%u",
++                if (total_sent == 0) {
++                    last_error_ = wait_error;
++                    ESP_LOGE(TAG, "Tcp send wait failed: errno=%d sent=%u/%u",
++                             wait_error, static_cast<unsigned>(total_sent),
++                             static_cast<unsigned>(data_size));
++                    return -1;
++                }
++
++                const int64_t now_us = esp_timer_get_time();
++                if (last_progress_us == 0) {
++                    last_progress_us = now_us;
++                }
++                const int64_t stalled_ms = (now_us - last_progress_us) / 1000;
++                if (stalled_ms < kTcpPartialSendProgressDeadlineMs) {
++                    continue;
++                }
++
++                last_error_ = EPIPE;
++                ESP_LOGE(TAG, "Tcp partial send timeout: errno=%d sent=%u/%u stalled_ms=%lld",
 +                         wait_error, static_cast<unsigned>(total_sent),
-+                         static_cast<unsigned>(data_size));
++                         static_cast<unsigned>(data_size), stalled_ms);
 +                return -1;
 +            }
 +
@@ -304,9 +331,8 @@ diff -Naur upstream/src/esp/esp_tcp.cc patched/src/esp/esp_tcp.cc
 +            ESP_LOGE(TAG, "Tcp send failed: errno=%d sent=%u/%u", send_errno,
 +                     static_cast<unsigned>(total_sent), static_cast<unsigned>(data_size));
 +            return -1;
-         }
- 
--        total_sent += ret;
++        }
++
 +        if (ret == 0) {
 +            int wait_error = 0;
 +            if (WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
@@ -320,15 +346,22 @@ diff -Naur upstream/src/esp/esp_tcp.cc patched/src/esp/esp_tcp.cc
 +        }
 +
 +        total_sent += static_cast<size_t>(ret);
++        last_progress_us = esp_timer_get_time();
 +
 +        if (total_sent < data_size) {
-+            int wait_error = 0;
-+            if (!WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
-+                last_error_ = wait_error;
-+                ESP_LOGE(TAG, "Tcp short send wait failed: wrote=%d sent=%u/%u errno=%d",
-+                         ret, static_cast<unsigned>(total_sent),
-+                         static_cast<unsigned>(data_size), wait_error);
-+                return -1;
++            // Some modem/socket stacks report a partial write even though the
++            // socket is still writable right away. Try to continue sending
++            // first; only fall back to select() once send() actually returns
++            // EAGAIN/EWOULDBLOCK on the next loop.
++            if (ret <= 0) {
++                int wait_error = 0;
++                if (!WaitForWritable(tcp_fd_, kTcpSendTimeoutMs, wait_error)) {
++                    last_error_ = wait_error;
++                    ESP_LOGE(TAG, "Tcp short send wait failed: wrote=%d sent=%u/%u errno=%d",
++                             ret, static_cast<unsigned>(total_sent),
++                             static_cast<unsigned>(data_size), wait_error);
++                    return -1;
++                }
 +            }
 +        }
      }
@@ -368,14 +401,24 @@ diff -Naur upstream/src/esp/esp_tcp.cc patched/src/esp/esp_tcp.cc
 diff -Naur upstream/src/web_socket.cc patched/src/web_socket.cc
 --- src/web_socket.cc	2026-05-25 15:23:15
 +++ src/web_socket.cc	2026-05-25 01:04:36
-@@ -1,6 +1,7 @@
+@@ -1,8 +1,16 @@
  #include "web_socket.h"
  #include "network_interface.h"
  #include <esp_log.h>
 +#include <esp_timer.h>
++#include <cerrno>
  #include <cstdlib>
  #include <cstring>
  #include <esp_pthread.h>
+ #define TAG "WebSocket"
++
++namespace {
++
++bool IsTransientSendBackpressure(int err) {
++    return err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT || err == EINTR;
++}
++
++}  // namespace
 @@ -130,12 +131,30 @@
      }
  
@@ -480,11 +523,17 @@ diff -Naur upstream/src/web_socket.cc patched/src/web_socket.cc
 +    }
 +    const int64_t t_tcp_before_us = esp_timer_get_time();
 +    const int tcp_ret = tcp_->Send(frame);
++    const int tcp_err = tcp_ != nullptr ? tcp_->GetLastError() : 0;
 +    const int32_t tcp_us = static_cast<int32_t>(esp_timer_get_time() - t_tcp_before_us);
 +    const int32_t total_us = static_cast<int32_t>(esp_timer_get_time() - t_enter_us);
 +    const bool ok = tcp_ret >= 0 && static_cast<size_t>(tcp_ret) == frame.size();
 +
 +    if (!ok) {
++        if (IsTransientSendBackpressure(tcp_err)) {
++            ESP_LOGW(TAG, "Send tcp backpressure: ret=%d wire=%u err=%d tcp_us=%d total_us=%d",
++                     tcp_ret, static_cast<unsigned>(frame.size()), tcp_err, tcp_us, total_us);
++            return false;
++        }
 +        ESP_LOGW(TAG, "Send tcp failed: ret=%d wire=%u tcp_us=%d total_us=%d",
 +                 tcp_ret, static_cast<unsigned>(frame.size()), tcp_us, total_us);
 +        connected_ = false;
