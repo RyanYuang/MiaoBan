@@ -68,24 +68,32 @@ void AudioService::Initialize(AudioCodec* codec) {
     // esp-sr AFE: ringbuffer full when feed runs but fetch is idle (e.g. wake word stopped).
     esp_log_level_set("AFE", ESP_LOG_ERROR);
 
+    //初始化OPUS Decoder
     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(codec->output_sample_rate(), OPUS_FRAME_DURATION_MS);
+    // 打开OPUS Decoder
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
     if (opus_decoder_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create audio decoder, error code: %d", ret);
     } else {
+        // 设置Decoder参数
         decoder_sample_rate_ = codec->output_sample_rate();
         decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
         decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_FRAME_DURATION_MS;
+        ESP_LOGI(TAG, "Decoder sample rate: %d, duration: %d, frame size: %d", decoder_sample_rate_, decoder_duration_ms_, decoder_frame_size_);
     }
+    //初始化OPUS Encoder
     esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
+    // 打开OPUS Encoder
     ret = esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &opus_encoder_);
     if (opus_encoder_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create audio encoder, error code: %d", ret);
     } else {
+        // 设置Encoder参数
         encoder_sample_rate_ = 16000;
         encoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
         esp_opus_enc_get_frame_size(opus_encoder_, &encoder_frame_size_, &encoder_outbuf_size_);
         encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
+        ESP_LOGI(TAG, "Encoder sample rate: %d, duration: %d, frame size: %d, outbuf size: %d", encoder_sample_rate_, encoder_duration_ms_, encoder_frame_size_, encoder_outbuf_size_);
     }
 
     if (codec->input_sample_rate() != 16000) {
@@ -98,12 +106,14 @@ void AudioService::Initialize(AudioCodec* codec) {
     }
 
 #if CONFIG_USE_AUDIO_PROCESSOR
+    // 创建音频前处理模块对象
     audio_processor_ = std::make_unique<AfeAudioProcessor>();
 #else
     audio_processor_ = std::make_unique<NoAudioProcessor>();
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        // 如果设置了音频前处理模块回调，则调用回调
         if (pcm_tap_) {
             // Oye meeting WS uplinks raw PCM; skip Opus encode queue (MAX_ENCODE_TASKS_IN_QUEUE=2
             // would block this callback after two frames and starve further mic uplink).

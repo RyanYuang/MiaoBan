@@ -14,6 +14,7 @@
 #include <lvgl.h>
 
 #include <functional>
+#include <mutex>
 #include <new>
 
 #if CONFIG_USE_OYE_CLOUD_API
@@ -26,7 +27,12 @@
 #include "oye/oye_audio_util.h"
 #include "oye/oye_cloud_api.h"
 #include "oye/oye_config.h"
+#include "oye/oye_meeting_stream.h"
 #include "protocols/oye_metting_protocol.h"
+
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+#include "ble/oye_ble_service.h"
+#endif
 
 #include <cJSON.h>
 #include <cstring>
@@ -41,9 +47,11 @@ constexpr uintptr_t kUserDataBack = 0x4241434Bu;
 constexpr uintptr_t kUserDataRefresh = 0x52454652u;
 constexpr uintptr_t kUserDataRecord = 0x52454344u;
 constexpr uintptr_t kUserDataRowBase = 0x4D545230u;
-constexpr int kRecordMs = 8000;
 constexpr int kListPageSize = 1;
-constexpr uint32_t kMeetingUiTaskStackWords = 2560;
+constexpr uint32_t kMeetingUiTaskStackWords = 4096;
+constexpr TickType_t kRecordStopPollTicks = pdMS_TO_TICKS(50);
+constexpr TickType_t kMeetingUpstreamReadyWaitTicks = pdMS_TO_TICKS(45000);
+constexpr TickType_t kMeetingReadyPollSliceTicks = pdMS_TO_TICKS(200);
 
 /** xTaskCreateStatic 用的栈/TCB 只分配一次并复用；此前每次请求都 malloc 且永不 free，导致 internal 碎片化。 */
 struct MeetingUiWorkerPool {
@@ -92,6 +100,54 @@ MeetingUiWorkerPool& MeetingUiWorkerPoolInstance() {
     return pool;
 }
 
+/** 会议 ASR / WebSocket 期间临时关闭 BLE 配网，析构或 Restore() 时按原状态恢复。 */
+struct BlePauseForMeetingAsr {
+    bool was_running = false;
+    bool stopped = false;
+
+    BlePauseForMeetingAsr() {
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+        auto& ble = OyeBleService::GetInstance();
+        was_running = ble.IsRunning();
+        if (!was_running) {
+            return;
+        }
+        ESP_LOGI(TAG,
+                 "pause BLE before meeting ASR (free_internal=%u largest_internal=%u)",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+        if (ble.Stop() == ESP_OK) {
+            stopped = true;
+            ESP_LOGI(TAG,
+                     "BLE paused for meeting ASR (free_internal=%u largest_internal=%u)",
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+        } else {
+            ESP_LOGE(TAG, "failed to pause BLE before meeting ASR");
+        }
+#endif
+    }
+
+    void Restore() {
+#ifdef CONFIG_USE_OYE_BLE_PROVISIONING
+        if (!was_running || !stopped) {
+            return;
+        }
+        auto& ble = OyeBleService::GetInstance();
+        if (ble.IsRunning()) {
+            return;
+        }
+        ESP_LOGI(TAG, "restore BLE after meeting ASR");
+        if (ble.Start() != ESP_OK) {
+            ESP_LOGE(TAG, "failed to restore BLE after meeting ASR");
+        }
+        stopped = false;
+#endif
+    }
+
+    ~BlePauseForMeetingAsr() { Restore(); }
+};
+
 void PostUiIfAlive(const std::shared_ptr<std::atomic<bool>>& alive, std::function<void()> fn) {
     if (alive == nullptr || !alive->load()) {
         return;
@@ -125,6 +181,30 @@ static std::string StatusText(const std::string& status) {
     }
     return status;
 }
+
+#if CONFIG_USE_OYE_CLOUD_API
+static std::string BuildDetailBody(const oye::MeetingInfo& info) {
+    std::string body;
+    if (!info.summary.empty()) {
+        body += "摘要:\n";
+        body += info.summary;
+        body += "\n\n";
+    }
+    if (!info.transcript_text.empty()) {
+        body += "转写:\n";
+        body += info.transcript_text;
+        body += "\n\n";
+    }
+    if (!info.error_message.empty()) {
+        body += "错误: ";
+        body += info.error_message;
+    }
+    if (body.empty()) {
+        body = "暂无纪要内容";
+    }
+    return body;
+}
+#endif
 
 }  // namespace
 
@@ -253,6 +333,10 @@ void MeetingPagePresenter::StartRecordAndUpload() {
 #if !CONFIG_USE_OYE_CLOUD_API
     return;
 #endif
+    if (recording_) {
+        RequestStopRecording();
+        return;
+    }
     if (busy_) {
         ESP_LOGW(TAG, "StartRecordAndUpload ignored: busy");
         return;
@@ -262,22 +346,58 @@ void MeetingPagePresenter::StartRecordAndUpload() {
         Show(model_);
         return;
     }
-    ESP_LOGI(TAG, "StartRecordAndUpload: record %d ms", kRecordMs);
+    if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+        model_.status_line = "请先结束当前语音对话";
+        Show(model_);
+        return;
+    }
+    ESP_LOGI(TAG, "StartRecordAndUpload: meeting ASR stream start");
     busy_ = true;
+    recording_ = true;
+    stop_recording_requested_ = false;
+    record_stop_flag_ = std::make_shared<std::atomic<bool>>(false);
     model_.loading = true;
-    model_.status_line = "录音中…";
+    model_.record_button_text = "结束录音";
+    model_.status_line = "连接识别服务…";
     Show(model_);
-    RunNetworkTask(MeetingTask);
+    RunNetworkTask(UploadTask);
+}
+
+void MeetingPagePresenter::RequestStopRecording() {
+#if !CONFIG_USE_OYE_CLOUD_API
+    return;
+#endif
+    if (!recording_ || stop_recording_requested_) {
+        return;
+    }
+    ESP_LOGI(TAG, "RequestStopRecording");
+    stop_recording_requested_ = true;
+    if (record_stop_flag_ != nullptr) {
+        record_stop_flag_->store(true);
+    }
+    PostUi([this]() {
+        model_.record_button_text = "结束中…";
+        model_.status_line = "结束录音…";
+        Show(model_);
+    });
 }
 
 void MeetingPagePresenter::NotifyTaskFailed(const char* status_line) {
     const std::string status = status_line;
     PostUi([this, status]() {
         busy_ = false;
+        ResetRecordingState();
         model_.loading = false;
         model_.status_line = status;
         Show(model_);
     });
+}
+
+void MeetingPagePresenter::ResetRecordingState() {
+    recording_ = false;
+    stop_recording_requested_ = false;
+    record_stop_flag_.reset();
+    model_.record_button_text = "录音纪要";
 }
 
 void MeetingPagePresenter::RunNetworkTask(void (*worker)(MeetingPagePresenter* self)) {
@@ -415,24 +535,7 @@ void MeetingPagePresenter::LoadDetailTask(MeetingPagePresenter* self) {
         self->model_.selected_id = info.id;
         self->model_.detail_title = info.title.empty() ? ("会议 #" + std::to_string(info.id)) : info.title;
         self->model_.detail_status = StatusText(info.status);
-        self->model_.detail_body.clear();
-        if (!info.summary.empty()) {
-            self->model_.detail_body += "摘要:\n";
-            self->model_.detail_body += info.summary;
-            self->model_.detail_body += "\n\n";
-        }
-        if (!info.transcript_text.empty()) {
-            self->model_.detail_body += "转写:\n";
-            self->model_.detail_body += info.transcript_text;
-            self->model_.detail_body += "\n\n";
-        }
-        if (!info.error_message.empty()) {
-            self->model_.detail_body += "错误: ";
-            self->model_.detail_body += info.error_message;
-        }
-        if (self->model_.detail_body.empty()) {
-            self->model_.detail_body = "暂无纪要内容";
-        }
+        self->model_.detail_body = BuildDetailBody(info);
         self->model_.status_line = "会议 #" + std::to_string(info.id);
         self->Show(self->model_);
     });
@@ -444,50 +547,238 @@ void MeetingPagePresenter::LoadDetailTask(MeetingPagePresenter* self) {
 void MeetingPagePresenter::UploadTask(MeetingPagePresenter* self) {
 #if CONFIG_USE_OYE_CLOUD_API
     const auto alive = self->page_alive_;
-    ESP_LOGI(TAG, "UploadTask: record begin");
-    std::vector<int16_t> pcm;
-    if (!oye::RecordPcmMs(kRecordMs, pcm)) {
-        ESP_LOGE(TAG, "UploadTask: RecordPcmMs failed");
+    const auto stop_flag = self->record_stop_flag_;
+    ESP_LOGI(TAG, "UploadTask: meeting ASR stream begin");
+    auto stream = std::make_unique<oye::MeetingStream>();
+    oye::MeetingStream* stream_ptr = stream.get();
+    std::mutex result_mutex;
+    std::string final_text;
+    int final_meeting_id = 0;
+    Application::GetInstance().SetOtaCheckSuspended(true);
+    auto restore_ota = []() { Application::GetInstance().SetOtaCheckSuspended(false); };
+    BlePauseForMeetingAsr ble_pause;
+
+    const bool stream_ok = stream_ptr->Start(
+        "设备端会议",
+        true,
+        [alive, self, &result_mutex, &final_text](const std::string& text) {
+            {
+                std::lock_guard<std::mutex> lock(result_mutex);
+                final_text = text;
+            }
+            PostUiIfAlive(alive, [self, text]() {
+                self->model_.show_detail = true;
+                self->model_.detail_title = "实时转写";
+                self->model_.detail_status = "识别中";
+                self->model_.detail_body = text.empty() ? "正在接收语音…" : text;
+                self->model_.status_line = "实时转写中…";
+                self->Show(self->model_);
+            });
+        },
+        [alive, self, &result_mutex, &final_text, &final_meeting_id](const std::string& text, int meeting_id) {
+            {
+                std::lock_guard<std::mutex> lock(result_mutex);
+                final_text = text;
+                final_meeting_id = meeting_id;
+            }
+            PostUiIfAlive(alive, [self, text]() {
+                self->model_.show_detail = true;
+                self->model_.detail_title = "会议转写";
+                self->model_.detail_status = "已提交";
+                self->model_.detail_body = text.empty() ? "转写完成" : text;
+                self->model_.status_line = "转写完成，正在生成纪要…";
+                self->Show(self->model_);
+            });
+        });
+    if (!stream_ok) {
+        ESP_LOGE(TAG, "UploadTask: MeetingStream::Start failed");
         PostUiIfAlive(alive, [self]() {
             self->busy_ = false;
+            self->ResetRecordingState();
             self->model_.loading = false;
-            self->model_.status_line = "录音失败";
+            self->model_.status_line = "连接识别服务失败";
+            self->Show(self->model_);
+        });
+        restore_ota();
+        return;
+    }
+
+    PostUiIfAlive(alive, [self]() {
+        self->model_.show_detail = true;
+        self->model_.detail_title = "会议录音";
+        self->model_.detail_status = "连接中";
+        self->model_.detail_body = "正在等待识别服务就绪…";
+        self->model_.status_line = "等待识别就绪…";
+        self->Show(self->model_);
+    });
+
+    const TickType_t ready_deadline = xTaskGetTickCount() + kMeetingUpstreamReadyWaitTicks;
+    bool upstream_ready = stream_ptr->IsUpstreamReady();
+    while (!upstream_ready && stream_ptr->IsRunning()) {
+        if (stop_flag != nullptr && stop_flag->load()) {
+            ESP_LOGI(TAG, "UploadTask: stop requested while waiting for ready");
+            break;
+        }
+        if (alive == nullptr || !alive->load()) {
+            break;
+        }
+        const TickType_t now = xTaskGetTickCount();
+        if (now >= ready_deadline) {
+            ESP_LOGW(TAG, "UploadTask: wait for WS ready timeout");
+            break;
+        }
+        TickType_t slice = ready_deadline - now;
+        if (slice > kMeetingReadyPollSliceTicks) {
+            slice = kMeetingReadyPollSliceTicks;
+        }
+        upstream_ready = stream_ptr->WaitForUpstreamReady(slice);
+    }
+
+    if (!upstream_ready) {
+        ESP_LOGE(TAG, "UploadTask: upstream not ready (running=%d interrupted=%d)",
+                 stream_ptr->IsRunning() ? 1 : 0, stream_ptr->WasInterrupted() ? 1 : 0);
+        stream_ptr->Stop(false, false);
+        stream.reset();
+        ble_pause.Restore();
+        restore_ota();
+        const bool user_cancel = stop_flag != nullptr && stop_flag->load();
+        PostUiIfAlive(alive, [self, user_cancel]() {
+            self->busy_ = false;
+            self->ResetRecordingState();
+            self->model_.loading = false;
+            self->model_.status_line = user_cancel ? "已取消" : "识别服务未就绪";
             self->Show(self->model_);
         });
         return;
     }
-    ESP_LOGI(TAG, "UploadTask: recorded %u samples", static_cast<unsigned>(pcm.size()));
 
-    std::vector<uint8_t> wav;
-    if (!oye::BuildWavFromPcm(pcm, wav)) {
-        ESP_LOGE(TAG, "UploadTask: BuildWavFromPcm failed");
-        PostUiIfAlive(alive, [self]() {
+    ESP_LOGI(TAG, "UploadTask: upstream ready, start microphone and PCM uplink");
+
+    auto& audio = Application::GetInstance().GetAudioService();
+    const bool was_processing = audio.IsAudioProcessorRunning();
+    const bool was_wake = audio.IsWakeWordRunning();
+    bool audio_streaming_started = false;
+    auto restore_audio = [&]() {
+        if (!audio_streaming_started) {
+            return;
+        }
+        audio.ClearPcmTap();
+        if (!was_processing) {
+            audio.EnableVoiceProcessing(false);
+        }
+        if (was_wake) {
+            audio.EnableWakeWordDetection(true);
+        }
+        audio_streaming_started = false;
+    };
+
+    audio.ClearPcmTap();
+    if (was_wake) {
+        audio.EnableWakeWordDetection(false);
+    }
+    if (!was_processing) {
+        audio.EnableVoiceProcessing(true);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    auto first_tap_logged = std::make_shared<std::atomic<bool>>(false);
+    audio.SetPcmTap([stream_ptr, first_tap_logged](const std::vector<int16_t>& pcm) {
+        if (stream_ptr == nullptr || !stream_ptr->IsRunning() || !stream_ptr->IsUpstreamReady() ||
+            pcm.empty()) {
+            return;
+        }
+        if (!first_tap_logged->exchange(true)) {
+            ESP_LOGI(TAG, "UploadTask: first PCM tap feed samples=%u", static_cast<unsigned>(pcm.size()));
+        }
+        stream_ptr->FeedPcm(pcm.data(), pcm.size());
+    });
+    audio_streaming_started = true;
+
+    PostUiIfAlive(alive, [self]() {
+        self->model_.show_detail = true;
+        self->model_.detail_title = "实时转写";
+        self->model_.detail_status = "录音中";
+        self->model_.detail_body = "请开始讲话，再次点击按钮结束录音";
+        self->model_.status_line = "录音与识别中…";
+        self->Show(self->model_);
+    });
+    while (stream_ptr->IsRunning()) {
+        if (stop_flag != nullptr && stop_flag->load()) {
+            break;
+        }
+        if (alive == nullptr || !alive->load()) {
+            break;
+        }
+        vTaskDelay(kRecordStopPollTicks);
+    }
+    restore_audio();
+
+    const bool user_requested_stop = stop_flag != nullptr && stop_flag->load();
+    if (!user_requested_stop && stream_ptr->WasInterrupted()) {
+        const std::string partial_text = stream_ptr->LatestText();
+        ESP_LOGW(TAG, "UploadTask: meeting ASR interrupted before user stop");
+        stream_ptr->Stop(false, false);
+        stream.reset();
+        ble_pause.Restore();
+        restore_ota();
+        PostUiIfAlive(alive, [self, partial_text]() {
             self->busy_ = false;
+            self->ResetRecordingState();
             self->model_.loading = false;
-            self->model_.status_line = "编码失败";
+            self->model_.show_detail = true;
+            self->model_.detail_title = "实时转写";
+            self->model_.detail_status = "连接中断";
+            self->model_.detail_body = partial_text.empty() ? "识别连接中断，请重试" : partial_text;
+            self->model_.status_line = "录音被意外中断";
             self->Show(self->model_);
         });
         return;
     }
 
     PostUiIfAlive(alive, [self]() {
-        self->model_.status_line = "上传中…";
+        self->model_.detail_status = "收尾中";
+        self->model_.status_line = "结束录音，等待识别完成…";
         self->Show(self->model_);
     });
 
-    ESP_LOGI(TAG, "UploadTask: wav %u bytes, uploading", static_cast<unsigned>(wav.size()));
+    stream_ptr->Stop(true);
+
+    std::string transcript = stream_ptr->LatestText();
     int meeting_id = 0;
-    esp_err_t up = oye::UploadMeetingAudio(wav.data(), wav.size(), "设备录音", meeting_id);
-    ESP_LOGI(TAG, "UploadTask: upload err=%s meeting_id=%d", esp_err_to_name(up), meeting_id);
-    if (up != ESP_OK || meeting_id <= 0) {
-        PostUiIfAlive(alive, [self]() {
+    {
+        std::lock_guard<std::mutex> lock(result_mutex);
+        if (!final_text.empty()) {
+            transcript = final_text;
+        }
+        meeting_id = final_meeting_id;
+    }
+    ESP_LOGI(TAG, "UploadTask: stream finished meeting_id=%d transcript_chars=%u", meeting_id,
+             static_cast<unsigned>(transcript.size()));
+    stream.reset();
+    restore_ota();
+
+    if (meeting_id <= 0) {
+        PostUiIfAlive(alive, [self, transcript]() {
             self->busy_ = false;
+            self->ResetRecordingState();
             self->model_.loading = false;
-            self->model_.status_line = "上传失败";
+            self->model_.show_detail = true;
+            self->model_.detail_title = "会议转写";
+            self->model_.detail_status = "失败";
+            self->model_.detail_body = transcript.empty() ? "未识别到有效语音内容" : transcript;
+            self->model_.status_line = "纪要提交失败";
             self->Show(self->model_);
         });
         return;
     }
+
+    PostUiIfAlive(alive, [self, transcript]() {
+        self->model_.show_detail = true;
+        self->model_.detail_title = "会议转写";
+        self->model_.detail_status = "生成中";
+        self->model_.detail_body = transcript.empty() ? "转写完成，等待纪要生成…" : transcript;
+        self->model_.status_line = "纪要生成中…";
+        self->Show(self->model_);
+    });
 
     ESP_LOGI(TAG, "UploadTask: poll meeting_id=%d", meeting_id);
     oye::MeetingInfo info;
@@ -500,20 +791,20 @@ void MeetingPagePresenter::UploadTask(MeetingPagePresenter* self) {
     }
     PostUiIfAlive(alive, [self, poll, info = std::move(info)]() mutable {
         self->busy_ = false;
+        self->ResetRecordingState();
         self->model_.loading = false;
         if (poll != ESP_OK) {
             ESP_LOGW(TAG, "UploadTask UI: poll failed");
             self->model_.status_line = "处理超时或失败";
             self->Show(self->model_);
-            self->RefreshList();
             return;
         }
         self->model_.show_detail = true;
         self->model_.selected_id = info.id;
         self->model_.detail_title = info.title.empty() ? "新会议" : info.title;
         self->model_.detail_status = StatusText(info.status);
-        self->model_.detail_body = info.summary.empty() ? "纪要生成完成" : info.summary;
-        self->model_.status_line = "上传完成";
+        self->model_.detail_body = BuildDetailBody(info);
+        self->model_.status_line = "纪要生成完成";
         self->Show(self->model_);
     });
 #else
@@ -525,7 +816,40 @@ void MeetingPagePresenter::MeetingTask(MeetingPagePresenter* self) {
 #if CONFIG_USE_OYE_CLOUD_API
     (void)self;
     ESP_LOGI(TAG, "MeetingTask: begin");
-    InitializeProtocol();
+    BlePauseForMeetingAsr ble_pause;
+
+    // 创建对话流实例
+    ESP_LOGI(TAG, "MeetingTask: create stream");
+    auto stream = std::make_unique<oye::MeetingStream>();
+    if (stream == nullptr) {
+        ESP_LOGW(TAG, "MeetingTask: stream is not initialized");
+        return;
+    }
+
+    // 启动对话流
+    ESP_LOGI(TAG, "MeetingTask: start stream");
+    stream->Start("会议", true, [](const std::string& text) {
+        ESP_LOGI(TAG, "MeetingTask: text=%s", text.c_str());
+    }, [](const std::string& text, int meeting_id) {
+        ESP_LOGI(TAG, "MeetingTask: text=%s meeting_id=%d", text.c_str(), meeting_id);
+    });
+
+    // 等待对话流结束
+    ESP_LOGI(TAG, "MeetingTask: wait stream end");
+    while (stream->IsRunning()) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    // 获取对话流文本
+    ESP_LOGI(TAG, "MeetingTask: get stream text");
+    const std::string text = stream->LatestText();
+    ESP_LOGI(TAG, "MeetingTask: text=%s", text.c_str());
+
+    // 停止对话流
+    stream->Stop();
+
+    // 释放对话流实例
+    stream.reset();
+
     ESP_LOGI(TAG, "MeetingTask: end");
 #else
     (void)self;

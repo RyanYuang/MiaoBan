@@ -197,6 +197,9 @@ void LvglMeetingPageView::Show(const MeetingPageModel& model) {
     } else {
         RebuildList(model);
         UpdateDetailPanel(model);
+        if (record_button_label_ != nullptr) {
+            lv_label_set_text(record_button_label_, model.record_button_text.c_str());
+        }
         if (status_label_ != nullptr) {
             lv_label_set_text(status_label_, model.status_line.c_str());
         }
@@ -292,12 +295,12 @@ void LvglMeetingPageView::BuildLayout(const MeetingPageModel& model)
     lv_obj_center(refresh_lab);
     lv_obj_set_user_data(refresh_btn, reinterpret_cast<void*>(kUserDataRefresh));
 
-    lv_obj_t* record_btn = lv_button_create(actions);
-    lv_obj_set_size(record_btn, 120, 40);
-    lv_obj_t* record_lab = lv_label_create(record_btn);
-    lv_label_set_text(record_lab, "录音上传");
-    lv_obj_center(record_lab);
-    lv_obj_set_user_data(record_btn, reinterpret_cast<void*>(kUserDataRecord));
+    record_button_ = lv_button_create(actions);
+    lv_obj_set_size(record_button_, 120, 40);
+    record_button_label_ = lv_label_create(record_button_);
+    lv_label_set_text(record_button_label_, model.record_button_text.c_str());
+    lv_obj_center(record_button_label_);
+    lv_obj_set_user_data(record_button_, reinterpret_cast<void*>(kUserDataRecord));
 
     status_label_ = lv_label_create(panel);
     lv_obj_set_width(status_label_, LV_PCT(100));
@@ -311,7 +314,7 @@ void LvglMeetingPageView::BuildLayout(const MeetingPageModel& model)
         ui::mvp::LvglPageAttachTouchHandlers(panel, touch_presenter_);
         ui::mvp::LvglPageAttachTouchHandlers(back, touch_presenter_);
         ui::mvp::LvglPageAttachTouchHandlers(refresh_btn, touch_presenter_);
-        ui::mvp::LvglPageAttachTouchHandlers(record_btn, touch_presenter_);
+        ui::mvp::LvglPageAttachTouchHandlers(record_button_, touch_presenter_);
     }
 
     root_ = panel;

@@ -32,10 +32,12 @@ private:
     void RefreshList();
     void OpenDetail(int meeting_id);
     void StartRecordAndUpload();
+    void RequestStopRecording();
     void RunNetworkTask(void (*worker)(MeetingPagePresenter* self));
     void NotifyTaskFailed(const char* status_line);
     void PostUi(std::function<void()> fn);
     bool IsPageAlive() const;
+    void ResetRecordingState();
 
     static void RefreshListTask(MeetingPagePresenter* self);
     static void LoadDetailTask(MeetingPagePresenter* self);
@@ -48,7 +50,10 @@ private:
     std::shared_ptr<std::atomic<bool>> page_alive_;
     MeetingPageModel model_;
     bool busy_ = false;
+    bool recording_ = false;
+    bool stop_recording_requested_ = false;
     int pending_detail_id_ = 0;
+    std::shared_ptr<std::atomic<bool>> record_stop_flag_;
 };
 
 }  // namespace ui::meeting

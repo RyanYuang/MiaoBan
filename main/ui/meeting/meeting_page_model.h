@@ -16,6 +16,7 @@ struct MeetingPageModel {
     std::string title = "会议纪要";
     std::vector<MeetingRowModel> meetings;
     std::string status_line;
+    std::string record_button_text = "录音纪要";
     bool loading = false;
     bool show_detail = false;
     int selected_id = 0;

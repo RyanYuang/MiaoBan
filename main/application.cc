@@ -77,34 +77,6 @@ void SerialTestTriggerTask(void*) {
 }
 #endif
 
-#if CONFIG_OYE_AUTO_VOICE_TEST
-void AutoVoiceTestTask(void*) {
-    ESP_LOGI(TAG, "Auto voice test armed: delay=%dms duration=%dms",
-             CONFIG_OYE_AUTO_VOICE_TEST_DELAY_MS,
-             CONFIG_OYE_AUTO_VOICE_TEST_DURATION_MS);
-
-    auto& app = Application::GetInstance();
-    for (int i = 0; i < 1200; ++i) {
-        if (app.GetDeviceState() == kDeviceStateIdle) {
-            vTaskDelay(pdMS_TO_TICKS(CONFIG_OYE_AUTO_VOICE_TEST_DELAY_MS));
-            if (app.GetDeviceState() != kDeviceStateIdle) {
-                continue;
-            }
-
-            ESP_LOGI(TAG, "Auto voice test: StartListening");
-            app.StartListening();
-            vTaskDelay(pdMS_TO_TICKS(CONFIG_OYE_AUTO_VOICE_TEST_DURATION_MS));
-            ESP_LOGI(TAG, "Auto voice test: StopListening");
-            app.StopListening();
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    vTaskDelete(nullptr);
-}
-#endif
-
 #ifdef CONFIG_USE_OYE_BLE_PROVISIONING
 void SyncOyeBleProvisioning(DeviceState state) {
     auto& ble = OyeBleService::GetInstance();
@@ -289,8 +261,10 @@ void Application::Initialize() {
     UiPageRouter::Instance().PostNavigateTo(UI_PAGE_ID(StickerChat));
     // 首条系统消息：展示板级名称与版本等 User-Agent 信息
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
-
+    
+    ESP_LOGI(TAG, "Initialize audio service");
     // 初始化音频服务并启动采集/播放管线
+    // 获取音频对象实例
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
@@ -320,12 +294,6 @@ void Application::Initialize() {
 #if CONFIG_OYE_SERIAL_TEST_TRIGGER
     if (xTaskCreate(SerialTestTriggerTask, "serial_test", 2048, nullptr, 3, nullptr) != pdPASS) {
         ESP_LOGW(TAG, "Failed to start serial test trigger task");
-    }
-#endif
-
-#if CONFIG_OYE_AUTO_VOICE_TEST
-    if (xTaskCreate(AutoVoiceTestTask, "auto_voice_test", 1536, nullptr, 3, nullptr) != pdPASS) {
-        ESP_LOGW(TAG, "Failed to start auto voice test task");
     }
 #endif
 
@@ -707,6 +675,14 @@ void Application::CheckNewVersion() {
 
     auto& board = Board::GetInstance();
     while (true) {
+        if (ota_check_suspended_.load()) {
+            ESP_LOGI(TAG, "OTA check suspended, waiting");
+            while (ota_check_suspended_.load()) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            ESP_LOGI(TAG, "OTA check resumed");
+        }
+
         auto display = board.GetDisplay();
         UiCommandDispatcher::Instance().Post([display]() {
             display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
@@ -729,6 +705,9 @@ void Application::CheckNewVersion() {
             ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
             for (int i = 0; i < retry_delay; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
+                if (ota_check_suspended_.load()) {
+                    break;
+                }
                 if (GetDeviceState() == kDeviceStateIdle) {
                     break;
                 }
@@ -777,6 +756,14 @@ void Application::CheckNewVersion() {
             }
         }
     }
+}
+
+void Application::SetOtaCheckSuspended(bool suspended) {
+    const bool old = ota_check_suspended_.exchange(suspended);
+    if (old == suspended) {
+        return;
+    }
+    ESP_LOGI(TAG, "OTA check suspended=%d", suspended ? 1 : 0);
 }
 
 /**

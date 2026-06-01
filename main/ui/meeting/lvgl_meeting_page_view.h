@@ -35,6 +35,8 @@ private:
     lv_obj_t* root_ = nullptr;
     lv_obj_t* list_panel_ = nullptr;
     lv_obj_t* detail_panel_ = nullptr;
+    lv_obj_t* record_button_ = nullptr;
+    lv_obj_t* record_button_label_ = nullptr;
     lv_obj_t* status_label_ = nullptr;
     lv_obj_t* detail_body_ = nullptr;
 };

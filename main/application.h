@@ -117,7 +117,6 @@ public:
      */
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
-    void UpdateRoundEndingIntentFromUserText(const std::string& text);
 
     void AbortSpeaking(AbortReason reason);
 #if CONFIG_OYE_SPEECH_END_DETECTION
@@ -152,6 +151,8 @@ public:
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     void OnVoiceResultPendingCleared();
+    void SetOtaCheckSuspended(bool suspended);
+    bool IsOtaCheckSuspended() const { return ota_check_suspended_.load(); }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -183,7 +184,6 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     DeviceState deferred_tts_stop_state_ = kDeviceStateUnknown;
-    bool end_conversation_after_round_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
     std::mutex recognition_text_listeners_mutex_;
@@ -199,6 +199,7 @@ private:
     std::atomic<bool> pcm_level_speaking_{false};
     std::atomic<bool> speech_activity_speaking_{false};
     std::atomic<bool> speech_activity_seen_{false};
+    std::atomic<bool> ota_check_suspended_{false};
     bool speech_started_ = false;
     bool speech_end_waiting_ = false;
     SpeechEndTimerReason speech_end_timer_reason_ = SpeechEndTimerReason::kNone;

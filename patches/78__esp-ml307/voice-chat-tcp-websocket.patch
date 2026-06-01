@@ -321,9 +321,9 @@ diff -Naur upstream/src/esp/esp_tcp.cc patched/src/esp/esp_tcp.cc
 +                }
 +
 +                last_error_ = EPIPE;
-+                ESP_LOGE(TAG, "Tcp partial send timeout: errno=%d sent=%u/%u stalled_ms=%lld",
++                ESP_LOGE(TAG, "Tcp partial send timeout: errno=%d sent=%u/%u stalled_ms=%ld",
 +                         wait_error, static_cast<unsigned>(total_sent),
-+                         static_cast<unsigned>(data_size), stalled_ms);
++                         static_cast<unsigned>(data_size), static_cast<long>(stalled_ms));
 +                return -1;
 +            }
 +

@@ -7,6 +7,7 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 #include <web_socket.h>
 
@@ -24,9 +25,13 @@ constexpr size_t kMinLargestInternalForWs = 4096;
 constexpr int kWsConnectAttempts = 3;
 constexpr int kWsRetryDelayMs = 400;
 // Stack in SPIRAM (see StartSendTask); WebSocket::Send needs headroom beyond frame buffer.
-constexpr int kSendTaskStackWords = 6144;
-constexpr int kSendTaskStackWordsInternalFallback = 2560;
+constexpr uint32_t kSendTaskStackBytes = 6144 * sizeof(StackType_t);
+constexpr uint32_t kSendTaskStackBytesInternalFallback = 2560 * sizeof(StackType_t);
 constexpr UBaseType_t kSendTaskPriority = 5;
+constexpr TickType_t kSendTaskStopWaitTicks = pdMS_TO_TICKS(7000);
+constexpr int kPcmSendPaceMs = 20;
+constexpr int kPcmSendRetryDelayMs = 20;
+constexpr int kPcmSendRetryMaxAttempts = 250;
 
 void LogTextPreview(const char* label, const std::string& text) {
     if (text.empty()) {
@@ -53,10 +58,12 @@ bool HeapOkForWs() {
 
 }  // namespace
 
+// 构造函数，创建事件组
 MeetingStream::MeetingStream() {
     done_event_ = xEventGroupCreate();
 }
 
+// 析构函数，停止对话流并删除事件组
 MeetingStream::~MeetingStream() {
     Stop(false);
     if (done_event_ != nullptr) {
@@ -65,6 +72,7 @@ MeetingStream::~MeetingStream() {
     }
 }
 
+// 进入传输增强模式，提高性能
 void MeetingStream::EnterTransportBoost() {
     if (!transport_boost_) {
         LogHeap("WS transport boost begin");
@@ -73,6 +81,7 @@ void MeetingStream::EnterTransportBoost() {
     }
 }
 
+// 离开传输增强模式，降低功耗
 void MeetingStream::LeaveTransportBoost() {
     if (transport_boost_) {
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
@@ -81,10 +90,12 @@ void MeetingStream::LeaveTransportBoost() {
     }
 }
 
+// 建立 WebSocket 连接 URL
 std::string MeetingStream::BuildWsUrl() {
     return BuildWebSocketUrl("/meetings/stream/ws");
 }
 
+// 初始化 PCM 队列
 bool MeetingStream::InitPcmQueue() {
     DestroyPcmQueue();
     pcm_queue_storage_ = static_cast<uint8_t*>(
@@ -107,6 +118,7 @@ bool MeetingStream::InitPcmQueue() {
     return true;
 }
 
+// 销毁 PCM 队列
 void MeetingStream::DestroyPcmQueue() {
     if (pcm_queue_ != nullptr) {
         vQueueDelete(pcm_queue_);
@@ -118,133 +130,162 @@ void MeetingStream::DestroyPcmQueue() {
     }
 }
 
+// 发送任务入口
 void MeetingStream::SendTaskEntry(void* arg) {
     static_cast<MeetingStream*>(arg)->PcmSendTask();
 }
 
-void MeetingStream::FreeSendTaskResources() {
-    if (send_task_stack_ != nullptr) {
-        heap_caps_free(send_task_stack_);
-        send_task_stack_ = nullptr;
-    }
-    if (send_task_tcb_ != nullptr) {
-        heap_caps_free(send_task_tcb_);
-        send_task_tcb_ = nullptr;
-    }
-}
-
+// 启动发送任务
 bool MeetingStream::StartSendTask() {
-    FreeSendTaskResources();
     send_task_run_ = true;
+    send_task_handle_ = nullptr;
     xEventGroupClearBits(done_event_, kSendTaskExitBit);
 
-    send_task_stack_ = static_cast<StackType_t*>(heap_caps_malloc(
-        static_cast<size_t>(kSendTaskStackWords) * sizeof(StackType_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    send_task_tcb_ =
-        static_cast<StaticTask_t*>(heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
-    if (send_task_stack_ != nullptr && send_task_tcb_ != nullptr) {
-        send_task_handle_ = xTaskCreateStatic(SendTaskEntry, "oye_ws_pcm", kSendTaskStackWords, this,
-                                              kSendTaskPriority, send_task_stack_, send_task_tcb_);
-        if (send_task_handle_ != nullptr) {
-            ESP_LOGI(TAG, "PCM send task created (SPIRAM stack %d words)", kSendTaskStackWords);
-            return true;
-        }
-        ESP_LOGW(TAG, "xTaskCreateStatic failed, try internal fallback");
-        FreeSendTaskResources();
-    } else {
-        ESP_LOGW(TAG, "SPIRAM stack alloc failed, try internal fallback");
-        FreeSendTaskResources();
+    if (xTaskCreateWithCaps(SendTaskEntry, "oye_ws_pcm", kSendTaskStackBytes, this, kSendTaskPriority,
+                            &send_task_handle_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS) {
+        ESP_LOGI(TAG, "PCM send task created (SPIRAM stack %u bytes)",
+                 static_cast<unsigned>(kSendTaskStackBytes));
+        return true;
     }
 
     LogHeap("StartSendTask fallback");
-    if (xTaskCreate(SendTaskEntry, "oye_ws_pcm", kSendTaskStackWordsInternalFallback, this,
-                    kSendTaskPriority, &send_task_handle_) != pdPASS) {
+    if (xTaskCreateWithCaps(SendTaskEntry, "oye_ws_pcm", kSendTaskStackBytesInternalFallback, this,
+                            kSendTaskPriority, &send_task_handle_,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         send_task_run_ = false;
         send_task_handle_ = nullptr;
         ESP_LOGE(TAG, "StartSendTask: xTaskCreate failed (need largest>=%u)",
-                 static_cast<unsigned>(kSendTaskStackWordsInternalFallback * sizeof(StackType_t)));
+                 static_cast<unsigned>(kSendTaskStackBytesInternalFallback));
         return false;
     }
-    ESP_LOGI(TAG, "PCM send task created (internal stack %d words)", kSendTaskStackWordsInternalFallback);
+    ESP_LOGI(TAG, "PCM send task created (internal stack %u bytes)",
+             static_cast<unsigned>(kSendTaskStackBytesInternalFallback));
     return true;
 }
 
+// 停止发送任务
 void MeetingStream::StopSendTask() {
     send_task_run_ = false;
     if (send_task_handle_ == nullptr) {
-        FreeSendTaskResources();
         return;
     }
-    const EventBits_t bits =
-        xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, pdMS_TO_TICKS(3000));
+    const EventBits_t bits = xEventGroupWaitBits(done_event_, kSendTaskExitBit, pdTRUE, pdTRUE, kSendTaskStopWaitTicks);
     if ((bits & kSendTaskExitBit) == 0) {
-        ESP_LOGW(TAG, "StopSendTask: send task exit timeout");
+        ESP_LOGW(TAG, "StopSendTask: send task exit timeout after %u ms",
+                 static_cast<unsigned>(kSendTaskStopWaitTicks * portTICK_PERIOD_MS));
+        return;
     }
     send_task_handle_ = nullptr;
-    FreeSendTaskResources();
 }
 
+// 发送任务主循环
 void MeetingStream::PcmSendTask() {
-    ESP_LOGI(TAG, "PCM send task started (stack=%d words)", kSendTaskStackWords);
-    // 独立发送任务：从 pcm_queue_ 取 60ms 定长帧并经 WebSocket 二进制上行。
-    // FeedPcm 只负责非阻塞入队，避免在音频回调里执行 Send 阻塞采集链路。
+    ESP_LOGI(TAG, "PCM send task started (stack=%u bytes)", static_cast<unsigned>(kSendTaskStackBytes));
+    // 独立发送任务：在后端 `ready` 前仅本地缓存 20ms PCM 帧，收到 `ready` 后再按实时节奏上行。
     while (send_task_run_) {
-        // 100ms 超时：队列空时也能周期性检查 send_task_run_，Stop 时可及时退出。
+        if (!running_ || websocket_ == nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (!stream_ready_) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        const TickType_t now = xTaskGetTickCount();
+        if (now < next_pcm_send_tick_) {
+            vTaskDelay(next_pcm_send_tick_ - now);
+            continue;
+        }
         if (xQueueReceive(pcm_queue_, send_frame_, pdMS_TO_TICKS(100)) != pdTRUE) {
             continue;
         }
-        // 会话未就绪或已停流时丢弃该帧（队列里可能仍有 Stop 前的残留帧）。
-        if (stream_ready_ && running_ && websocket_ != nullptr) {
-            SendPcmChunk(send_frame_, kPcmFrameSamples);
+
+        bool sent = false;
+        for (int attempt = 0; send_task_run_ && stream_ready_ && running_; ++attempt) {
+            if (SendPcmChunk(send_frame_, kPcmFrameSamples)) {
+                sent = true;
+                break;
+            }
+            if (attempt + 1 >= kPcmSendRetryMaxAttempts) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kPcmSendRetryDelayMs));
+        }
+
+        if (sent) {
+            next_pcm_send_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(kPcmSendPaceMs);
+        } else {
+            ESP_LOGE(TAG, "PCM send gave up after retries, halt meeting uplink");
+            stream_ready_ = false;
+            if (!end_requested_ && !session_finished_) {
+                interrupted_ = true;
+            }
+            running_ = false;
+            send_task_run_ = false;
+            SignalSessionEnd();
         }
     }
-    // 主循环退出后 drain 队列：Stop 已置 running_=false，但仍尽量在关 WS 前发完积压帧。
     while (xQueueReceive(pcm_queue_, send_frame_, 0) == pdTRUE) {
-        if (websocket_ != nullptr) {
-            SendPcmChunk(send_frame_, kPcmFrameSamples);
-        }
     }
     ESP_LOGI(TAG, "PCM send task exit (feeds=%u drops=%u)", static_cast<unsigned>(pcm_feed_count_),
              static_cast<unsigned>(pcm_queue_drops_));
     send_task_handle_ = nullptr;
     xEventGroupSetBits(done_event_, kSendTaskExitBit);
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
+// 启动对话流
 bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallback on_asr,
                           DoneCallback on_done) {
     ESP_LOGI(TAG, "Start title=%s save_meeting=%d", title.c_str(), save_meeting ? 1 : 0);
+    // 停止对话流
     Stop(false);
+    // 检查是否有后端的访问令牌
     if (!HasAccessToken()) {
         ESP_LOGE(TAG, "Start: no access token");
         return false;
     }
 
+    // 设置回调函数
     on_asr_ = std::move(on_asr);
     on_done_ = std::move(on_done);
+    // 设置保存会议标志
     save_meeting_ = save_meeting;
+    // 重置计数器
     pcm_feed_count_ = 0;
     pcm_bytes_sent_ = 0;
     pcm_queue_drops_ = 0;
+    pcm_accum_.clear();
+    pcm_accum_.reserve(kPcmAccumMaxSamples);
     stream_ready_ = false;
+    next_pcm_send_tick_ = 0;
     session_finished_ = false;
+    interrupted_ = false;
+    end_requested_ = false;
+    // 清除事件组
     if (done_event_ != nullptr) {
-        xEventGroupClearBits(done_event_, kDoneReceivedBit | kSendTaskExitBit);
+        xEventGroupClearBits(done_event_, kDoneReceivedBit | kSendTaskExitBit | kStreamReadyBit);
     }
 
+    // 检查堆内存是否足够
     if (!HeapOkForWs()) {
         LogHeap("Start: reject WS (low internal heap)");
         return false;
     }
 
+    // 初始化 PCM 队列
     if (!InitPcmQueue()) {
         return false;
     }
 
+    // 进入传输增强模式
     EnterTransportBoost();
+    // 延迟80ms
     vTaskDelay(pdMS_TO_TICKS(80));
 
+    // 获取网络实例
     auto network = Board::GetInstance().GetNetwork();
+    // 创建 WebSocket 实例
     std::unique_ptr<WebSocket> ws = network->CreateWebSocket(2);
     if (ws == nullptr) {
         ESP_LOGE(TAG, "Start: CreateWebSocket failed");
@@ -253,8 +294,11 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
         return false;
     }
 
-    std::string url = BuildWsUrl();
+    // 构建 WebSocket URL
+    const std::string url = BuildWsUrl();
     ESP_LOGI(TAG, "WS connect (token redacted) path=%s/meetings/stream/ws", kApiPrefix);
+
+    // 设置数据回调
     ws->OnData([this](const char* data, size_t len, bool binary) {
         if (!binary && data != nullptr && len > 0) {
             HandleText(data, len);
@@ -264,6 +308,9 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
         ESP_LOGW(TAG, "WS disconnected (feeds=%u bytes=%u drops=%u)",
                  static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                  static_cast<unsigned>(pcm_queue_drops_));
+        if (!end_requested_ && !session_finished_) {
+            interrupted_ = true;
+        }
         stream_ready_ = false;
         running_ = false;
         send_task_run_ = false;
@@ -325,29 +372,38 @@ bool MeetingStream::Start(const std::string& title, bool save_meeting, TextCallb
     }
 
     running_ = true;
-    stream_ready_ = true;
+    stream_ready_ = false;
+    ESP_LOGI(TAG, "waiting for backend ready before PCM uplink");
     return true;
 }
 
+// 发送 PCM 数据块
 bool MeetingStream::SendPcmChunk(const int16_t* samples, size_t count) {
     if (websocket_ == nullptr || samples == nullptr || count == 0) {
         return false;
     }
     auto* socket = static_cast<WebSocket*>(websocket_);
     if (!socket->IsConnected()) {
+        if (!end_requested_ && !session_finished_) {
+            interrupted_ = true;
+        }
         stream_ready_ = false;
         return false;
     }
     const size_t bytes = count * sizeof(int16_t);
     if (!socket->Send(reinterpret_cast<const char*>(samples), bytes, true)) {
         if (!socket->IsConnected()) {
+            if (!end_requested_ && !session_finished_) {
+                interrupted_ = true;
+            }
             stream_ready_ = false;
             running_ = false;
             ESP_LOGW(TAG, "WS send failed, connection lost (feeds=%u bytes=%u err=%d)",
                      static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
                      socket->GetLastError());
         } else {
-            ESP_LOGW(TAG, "binary PCM send failed (%u bytes)", static_cast<unsigned>(bytes));
+            ESP_LOGD(TAG, "binary PCM send blocked (%u bytes) err=%d, will retry",
+                     static_cast<unsigned>(bytes), socket->GetLastError());
         }
         return false;
     }
@@ -362,23 +418,44 @@ bool MeetingStream::SendPcmChunk(const int16_t* samples, size_t count) {
     return true;
 }
 
+// 刷新 PCM 累积队列
+void MeetingStream::FlushPcmAccumToQueue() {
+    if (pcm_queue_ == nullptr) {
+        return;
+    }
+    while (pcm_accum_.size() >= kPcmFrameSamples) {
+        if (xQueueSend(pcm_queue_, pcm_accum_.data(), 0) != pdTRUE) {
+            ++pcm_queue_drops_;
+            if ((pcm_queue_drops_ % 20) == 1) {
+                ESP_LOGW(TAG, "PCM queue full, dropped frame (drops=%u)", static_cast<unsigned>(pcm_queue_drops_));
+            }
+        }
+        pcm_accum_.erase(pcm_accum_.begin(), pcm_accum_.begin() + kPcmFrameSamples);
+    }
+}
+
+// 喂入 PCM 数据
+bool MeetingStream::WaitForUpstreamReady(TickType_t ticks) {
+    if (stream_ready_) {
+        return true;
+    }
+    if (done_event_ == nullptr || !running_) {
+        return false;
+    }
+    const EventBits_t bits =
+        xEventGroupWaitBits(done_event_, kStreamReadyBit, pdFALSE, pdTRUE, ticks);
+    return (bits & kStreamReadyBit) != 0 && stream_ready_ && running_;
+}
+
 void MeetingStream::FeedPcm(const int16_t* samples, size_t count) {
     if (!running_ || !stream_ready_ || pcm_queue_ == nullptr || samples == nullptr || count == 0) {
         return;
     }
-    if (count != kPcmFrameSamples) {
-        ESP_LOGW(TAG, "FeedPcm: unexpected frame size %u (expected %u)", static_cast<unsigned>(count),
-                 static_cast<unsigned>(kPcmFrameSamples));
-        return;
-    }
-    if (xQueueSend(pcm_queue_, samples, 0) != pdTRUE) {
-        ++pcm_queue_drops_;
-        if ((pcm_queue_drops_ % 20) == 1) {
-            ESP_LOGW(TAG, "PCM queue full, dropped frame (drops=%u)", static_cast<unsigned>(pcm_queue_drops_));
-        }
-    }
+    pcm_accum_.insert(pcm_accum_.end(), samples, samples + count);
+    FlushPcmAccumToQueue();
 }
 
+// 信号会话结束
 void MeetingStream::SignalSessionEnd() {
     if (session_finished_) {
         return;
@@ -389,6 +466,7 @@ void MeetingStream::SignalSessionEnd() {
     }
 }
 
+// 关闭 WebSocket 连接
 void MeetingStream::CloseWebSocket() {
     if (websocket_ != nullptr) {
         delete static_cast<WebSocket*>(websocket_);
@@ -396,23 +474,31 @@ void MeetingStream::CloseWebSocket() {
     }
 }
 
-void MeetingStream::Stop(bool wait_for_done) {
+// 停止对话流
+void MeetingStream::Stop(bool wait_for_done, bool send_end) {
     if (!running_ && websocket_ == nullptr && !transport_boost_ && send_task_handle_ == nullptr) {
         return;
     }
 
+    if (send_end) {
+        end_requested_ = true;
+    }
     stream_ready_ = false;
     running_ = false;
     StopSendTask();
     DestroyPcmQueue();
 
     if (websocket_ != nullptr) {
-        ESP_LOGI(TAG, "Stop: sending end (feeds=%u bytes=%u drops=%u wait_done=%d)",
+        ESP_LOGI(TAG, "Stop: closing stream (feeds=%u bytes=%u drops=%u wait_done=%d send_end=%d)",
                  static_cast<unsigned>(pcm_feed_count_), static_cast<unsigned>(pcm_bytes_sent_),
-                 static_cast<unsigned>(pcm_queue_drops_), wait_for_done ? 1 : 0);
+                 static_cast<unsigned>(pcm_queue_drops_), wait_for_done ? 1 : 0, send_end ? 1 : 0);
         auto* socket = static_cast<WebSocket*>(websocket_);
-        if (!socket->Send(R"({"action":"end"})")) {
-            ESP_LOGW(TAG, "send end JSON failed, closing WS");
+        if (send_end) {
+            if (!socket->Send(R"({"action":"end"})")) {
+                ESP_LOGW(TAG, "send end JSON failed, closing WS");
+                wait_for_done = false;
+            }
+        } else {
             wait_for_done = false;
         }
 
@@ -432,11 +518,13 @@ void MeetingStream::Stop(bool wait_for_done) {
     LeaveTransportBoost();
 }
 
+// 获取最新文本
 std::string MeetingStream::LatestText() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return latest_text_;
 }
 
+// 处理文本消息
 void MeetingStream::HandleText(const char* data, size_t len) {
     std::string payload(data, len);
     cJSON* root = cJSON_Parse(payload.c_str());
@@ -486,6 +574,15 @@ void MeetingStream::HandleText(const char* data, size_t len) {
             on_done_(latest_text_, meeting_id);
         }
         SignalSessionEnd();
+    } else if (strcmp(type->valuestring, "ready") == 0) {
+        stream_ready_ = true;
+        next_pcm_send_tick_ = xTaskGetTickCount();
+        if (done_event_ != nullptr) {
+            xEventGroupSetBits(done_event_, kStreamReadyBit);
+        }
+        auto msg = cJSON_GetObjectItem(root, "message");
+        ESP_LOGI(TAG, "WS ready: backend upstream prepared, start PCM uplink (%s)",
+                 cJSON_IsString(msg) ? msg->valuestring : "ok");
     } else if (strcmp(type->valuestring, "info") == 0) {
         auto msg = cJSON_GetObjectItem(root, "message");
         ESP_LOGI(TAG, "WS info: %s", cJSON_IsString(msg) ? msg->valuestring : "(no message)");
